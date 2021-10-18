@@ -1,0 +1,27 @@
+[package]
+name = "poem-derive"
+version = "1.0.3"
+authors = ["sunli <scott_s829@163.com>"]
+edition = "2018"
+description = "Macros for poem"
+license = "MIT/Apache-2.0"
+documentation = "https://docs.rs/poem/"
+homepage = "https://github.com/poem-web/poem"
+repository = "https://github.com/poem-web/poem"
+keywords = ["http", "web", "framework", "async"]
+categories = [
+    "network-programming",
+    "asynchronous",
+    "web-programming::http-server",
+    "web-programming::websocket",
+]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+darling = "0.13.0"
+proc-macro-crate = "1.1.0"
+proc-macro2 = "1.0.29"
+quote = "1.0.9"
+syn = { version = "1.0.77", features = ["full"] }
