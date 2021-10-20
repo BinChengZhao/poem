@@ -6,7 +6,7 @@ use crate::{
     Endpoint, Middleware, Request,
 };
 
-/// Use cookies for session storage.
+/// Middleware for client-side(cookie) session.
 pub struct CookieSession {
     config: Arc<CookieConfig>,
 }

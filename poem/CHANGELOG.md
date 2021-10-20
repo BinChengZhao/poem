@@ -6,7 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+- `Cors` middleware allows all HTTP methods and headers by default.
+- Add `Cors::allow_origins_fn` method.
+
+# [1.0.5] 2010-10-19
+
 - Add `RouteDomain` for `Host` header routing.
+- Add `CookieSession` and `RedisSession` middlewares.
+- Add `RequestBuilder::typed_header` and `ResponseBuilder::typed_header` methods.
+- Improve Cors middleware.
 
 # [1.0.4] 2010-10-15
 
