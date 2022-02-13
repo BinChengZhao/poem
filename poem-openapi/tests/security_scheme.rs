@@ -7,7 +7,7 @@ use poem_openapi::{
     auth::{ApiKey, Basic, Bearer},
     payload::PlainText,
     registry::{MetaOAuthFlow, MetaOAuthFlows, MetaOAuthScope, MetaSecurityScheme, Registry},
-    OAuthScopes, OpenApi, OpenApiService, SecurityScheme,
+    ApiExtractor, OAuthScopes, OpenApi, OpenApiService, SecurityScheme,
 };
 use typed_headers::{http::StatusCode, Token68};
 
@@ -17,7 +17,7 @@ fn rename() {
     #[oai(rename = "ABC", type = "basic")]
     struct MySecurityScheme(Basic);
 
-    assert_eq!(MySecurityScheme::NAME, "ABC");
+    assert_eq!(MySecurityScheme::security_scheme().unwrap(), "ABC");
 }
 
 #[test]
@@ -26,7 +26,10 @@ fn default_rename() {
     #[oai(type = "basic")]
     struct MySecurityScheme(Basic);
 
-    assert_eq!(MySecurityScheme::NAME, "my_security_scheme");
+    assert_eq!(
+        MySecurityScheme::security_scheme().unwrap(),
+        "MySecurityScheme"
+    );
 }
 
 #[test]
@@ -43,11 +46,31 @@ fn desc() {
     assert_eq!(
         registry
             .security_schemes
-            .get("my_security_scheme")
+            .get("MySecurityScheme")
             .unwrap()
             .description,
         Some("ABC\n\nD")
     );
+}
+
+#[tokio::test]
+async fn no_auth() {
+    struct MyApi;
+
+    #[OpenApi]
+    impl MyApi {
+        #[oai(path = "/test", method = "get")]
+        async fn test(&self) -> PlainText<String> {
+            PlainText("test".to_string())
+        }
+    }
+
+    let service = OpenApiService::new(MyApi, "test", "1.0");
+    let spec_string = service.spec();
+    let spec = serde_json::from_str::<serde_json::Value>(&spec_string).unwrap();
+
+    assert_eq!(spec["paths"]["/test"]["get"].get("security"), None);
+    assert_eq!(spec["components"].get("securitySchemes"), None);
 }
 
 #[tokio::test]
@@ -59,7 +82,7 @@ async fn basic_auth() {
     let mut registry = Registry::new();
     MySecurityScheme::register(&mut registry);
     assert_eq!(
-        registry.security_schemes.get("my_security_scheme").unwrap(),
+        registry.security_schemes.get("MySecurityScheme").unwrap(),
         &MetaSecurityScheme {
             ty: "http",
             description: None,
@@ -77,12 +100,12 @@ async fn basic_auth() {
     #[OpenApi]
     impl MyApi {
         #[oai(path = "/test", method = "get")]
-        async fn test(&self, #[oai(auth)] auth: MySecurityScheme) -> PlainText<String> {
+        async fn test(&self, auth: MySecurityScheme) -> PlainText<String> {
             PlainText(format!("{}/{}", auth.0.username, auth.0.password))
         }
     }
 
-    let service = OpenApiService::new(MyApi).into_endpoint();
+    let service = OpenApiService::new(MyApi, "test", "1.0").into_endpoint();
     let mut resp = service
         .call(
             poem::Request::builder()
@@ -95,7 +118,8 @@ async fn basic_auth() {
                 )
                 .finish(),
         )
-        .await;
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.take_body().into_string().await.unwrap(), "abc/123456");
 }
@@ -109,7 +133,7 @@ async fn bearer_auth() {
     let mut registry = Registry::new();
     MySecurityScheme::register(&mut registry);
     assert_eq!(
-        registry.security_schemes.get("my_security_scheme").unwrap(),
+        registry.security_schemes.get("MySecurityScheme").unwrap(),
         &MetaSecurityScheme {
             ty: "http",
             description: None,
@@ -127,12 +151,12 @@ async fn bearer_auth() {
     #[OpenApi]
     impl MyApi {
         #[oai(path = "/test", method = "get")]
-        async fn test(&self, #[oai(auth)] auth: MySecurityScheme) -> PlainText<String> {
+        async fn test(&self, auth: MySecurityScheme) -> PlainText<String> {
             PlainText(auth.0.token)
         }
     }
 
-    let service = OpenApiService::new(MyApi).into_endpoint();
+    let service = OpenApiService::new(MyApi, "test", "1.0").into_endpoint();
     let mut resp = service
         .call(
             poem::Request::builder()
@@ -143,7 +167,8 @@ async fn bearer_auth() {
                 )
                 .finish(),
         )
-        .await;
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.take_body().into_string().await.unwrap(), "abcdef");
 }
@@ -170,7 +195,7 @@ async fn api_key_auth() {
     assert_eq!(
         registry
             .security_schemes
-            .get("my_security_scheme_in_header")
+            .get("MySecuritySchemeInHeader")
             .unwrap(),
         &MetaSecurityScheme {
             ty: "apiKey",
@@ -187,7 +212,7 @@ async fn api_key_auth() {
     assert_eq!(
         registry
             .security_schemes
-            .get("my_security_scheme_in_query")
+            .get("MySecuritySchemeInQuery")
             .unwrap(),
         &MetaSecurityScheme {
             ty: "apiKey",
@@ -204,7 +229,7 @@ async fn api_key_auth() {
     assert_eq!(
         registry
             .security_schemes
-            .get("my_security_scheme_in_cookie")
+            .get("MySecuritySchemeInCookie")
             .unwrap(),
         &MetaSecurityScheme {
             ty: "apiKey",
@@ -223,31 +248,22 @@ async fn api_key_auth() {
     #[OpenApi]
     impl MyApi {
         #[oai(path = "/header", method = "get")]
-        async fn test_in_header(
-            &self,
-            #[oai(auth)] auth: MySecuritySchemeInHeader,
-        ) -> PlainText<String> {
+        async fn test_in_header(&self, auth: MySecuritySchemeInHeader) -> PlainText<String> {
             PlainText(auth.0.key)
         }
 
         #[oai(path = "/query", method = "get")]
-        async fn test_in_query(
-            &self,
-            #[oai(auth)] auth: MySecuritySchemeInQuery,
-        ) -> PlainText<String> {
+        async fn test_in_query(&self, auth: MySecuritySchemeInQuery) -> PlainText<String> {
             PlainText(auth.0.key)
         }
 
         #[oai(path = "/cookie", method = "get")]
-        async fn test_in_cookie(
-            &self,
-            #[oai(auth)] auth: MySecuritySchemeInCookie,
-        ) -> PlainText<String> {
+        async fn test_in_cookie(&self, auth: MySecuritySchemeInCookie) -> PlainText<String> {
             PlainText(auth.0.key)
         }
     }
 
-    let service = OpenApiService::new(MyApi).into_endpoint();
+    let service = OpenApiService::new(MyApi, "test", "1.0").into_endpoint();
     let mut resp = service
         .call(
             poem::Request::builder()
@@ -255,7 +271,8 @@ async fn api_key_auth() {
                 .header("X-API-Key", "abcdef")
                 .finish(),
         )
-        .await;
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.take_body().into_string().await.unwrap(), "abcdef");
 
@@ -265,7 +282,8 @@ async fn api_key_auth() {
                 .uri(Uri::from_static("/query?key=abcdef"))
                 .finish(),
         )
-        .await;
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.take_body().into_string().await.unwrap(), "abcdef");
 
@@ -279,7 +297,8 @@ async fn api_key_auth() {
                 )
                 .finish(),
         )
-        .await;
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.take_body().into_string().await.unwrap(), "abcdef");
 }
@@ -327,13 +346,13 @@ async fn oauth2_scopes_rename_item() {
                 description: None
             },
             MetaOAuthScope {
-                name: "write",
+                name: "Write",
                 description: None
             }
         ]
     );
     assert_eq!(GithubScopes::Read.name(), "r_ead");
-    assert_eq!(GithubScopes::Write.name(), "write");
+    assert_eq!(GithubScopes::Write.name(), "Write");
 }
 
 #[tokio::test]
@@ -351,11 +370,11 @@ async fn oauth2_scopes_description() {
         GithubScopes::meta(),
         &[
             MetaOAuthScope {
-                name: "read",
+                name: "Read",
                 description: Some("Read data")
             },
             MetaOAuthScope {
-                name: "write",
+                name: "Write",
                 description: Some("Write data")
             }
         ]
@@ -397,7 +416,7 @@ async fn oauth2_auth() {
     let mut registry = Registry::new();
     MySecurityScheme::register(&mut registry);
     assert_eq!(
-        registry.security_schemes.get("my_security_scheme").unwrap(),
+        registry.security_schemes.get("MySecurityScheme").unwrap(),
         &MetaSecurityScheme {
             ty: "oauth2",
             description: None,

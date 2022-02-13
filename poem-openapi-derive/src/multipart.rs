@@ -1,19 +1,15 @@
-use darling::{
-    ast::Data,
-    util::{Ignored, SpannedValue},
-    FromDeriveInput, FromField,
-};
+use std::str::FromStr;
+
+use darling::{ast::Data, util::Ignored, FromDeriveInput, FromField};
 use proc_macro2::{Ident, TokenStream};
 use quote::quote;
 use syn::{ext::IdentExt, Attribute, DeriveInput, Error, Generics, Type};
 
 use crate::{
-    common_args::{
-        DefaultValue, MaximumValidator, MinimumValidator, RenameRule, RenameRuleExt, RenameTarget,
-    },
+    common_args::{DefaultValue, RenameRule, RenameRuleExt},
     error::GeneratorResult,
-    utils::{get_crate_name, get_summary_and_description, optional_literal},
-    validators::HasValidators,
+    utils::{get_crate_name, get_description, optional_literal},
+    validators::Validators,
 };
 
 #[derive(FromField)]
@@ -29,28 +25,9 @@ struct MultipartField {
     rename: Option<String>,
     #[darling(default)]
     default: Option<DefaultValue>,
-
     #[darling(default)]
-    multiple_of: Option<SpannedValue<f64>>,
-    #[darling(default)]
-    maximum: Option<SpannedValue<MaximumValidator>>,
-    #[darling(default)]
-    minimum: Option<SpannedValue<MinimumValidator>>,
-    #[darling(default)]
-    max_length: Option<SpannedValue<usize>>,
-    #[darling(default)]
-    min_length: Option<SpannedValue<usize>>,
-    #[darling(default)]
-    pattern: Option<SpannedValue<String>>,
-    #[darling(default)]
-    max_items: Option<SpannedValue<usize>>,
-    #[darling(default)]
-    min_items: Option<SpannedValue<usize>>,
-    #[darling(default)]
-    unique_items: bool,
+    validator: Option<Validators>,
 }
-
-impl_has_validators!(MultipartField);
 
 #[derive(FromDeriveInput)]
 #[darling(attributes(oai))]
@@ -63,6 +40,8 @@ struct MultipartArgs {
     internal: bool,
     #[darling(default)]
     rename_all: Option<RenameRule>,
+    #[darling(default)]
+    deny_unknown_fields: bool,
 }
 
 pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
@@ -101,32 +80,33 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
             continue;
         }
 
-        let field_name = field.rename.clone().unwrap_or_else(|| {
-            args.rename_all
-                .rename(field_ident.unraw().to_string(), RenameTarget::Field)
-        });
-        let (field_title, field_description) = get_summary_and_description(&field.attrs)?;
-        let field_title = optional_literal(&field_title);
+        let field_name = field
+            .rename
+            .clone()
+            .unwrap_or_else(|| args.rename_all.rename(field_ident.unraw().to_string()));
+        let field_description = get_description(&field.attrs)?;
         let field_description = optional_literal(&field_description);
-        let validators_checker = field
-            .validators()
-            .create_multipart_field_checker(&crate_name, &field_name)?;
-        let validators_update_meta = field.validators().create_update_meta(&crate_name)?;
+        let validators = field.validator.clone().unwrap_or_default();
+        let validators_checker =
+            validators.create_multipart_field_checker(&crate_name, &field_name)?;
+        let validators_update_meta = validators.create_update_meta(&crate_name)?;
 
         fields.push(field_ident);
+
+        let parse_err = quote! {{
+            #crate_name::error::ParseMultipartError {
+                reason: ::std::format!("failed to parse field `{}`: {}", #field_name, err.into_message()),
+            }
+        }};
 
         deserialize_fields.push(quote! {
             if field.name() == ::std::option::Option::Some(#field_name) {
                 #field_ident = match #field_ident {
                     ::std::option::Option::Some(value) => {
-                        ::std::option::Option::Some(<#field_ty as #crate_name::types::ParseFromMultipartField>::parse_from_repeated_field(value, field).await.map_err(|err|
-                            #crate_name::ParseRequestError::ParseRequestBody { reason: ::std::format!("failed to parse field `{}`: {}", #field_name, err.into_message()) }
-                        )?)
+                        ::std::option::Option::Some(<#field_ty as #crate_name::types::ParseFromMultipartField>::parse_from_repeated_field(value, field).await.map_err(|err| #parse_err )?)
                     }
                     ::std::option::Option::None => {
-                        ::std::option::Option::Some(<#field_ty as #crate_name::types::ParseFromMultipartField>::parse_from_multipart(::std::option::Option::Some(field)).await.map_err(|err|
-                            #crate_name::ParseRequestError::ParseRequestBody { reason: ::std::format!("failed to parse field `{}`: {}", #field_name, err.into_message()) }
-                        )?)
+                        ::std::option::Option::Some(<#field_ty as #crate_name::types::ParseFromMultipartField>::parse_from_multipart(::std::option::Option::Some(field)).await.map_err(|err| #parse_err )?)
                     }
                 };
                 continue;
@@ -161,7 +141,9 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
                         },
                         ::std::option::Option::None => {
                             <#field_ty as #crate_name::types::ParseFromMultipartField>::parse_from_multipart(::std::option::Option::None).await.map_err(|_|
-                                #crate_name::ParseRequestError::ParseRequestBody { reason: ::std::format!("field `{}` is required", #field_name) }
+                                #crate_name::error::ParseMultipartError {
+                                    reason: ::std::format!("field `{}` is required", #field_name),
+                                }
                             )?
                         }
                     };
@@ -169,24 +151,22 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
             }
         }
 
+        let has_default = field.default.is_some();
         let field_meta_default = match &field.default {
             Some(DefaultValue::Default) => {
-                quote!(::std::option::Option::Some(#crate_name::types::ToJSON::to_json(&<#field_ty as ::std::default::Default>::default())))
+                quote!(#crate_name::types::ToJSON::to_json(&<#field_ty as ::std::default::Default>::default()))
             }
             Some(DefaultValue::Function(func_name)) => {
-                quote!(::std::option::Option::Some(#crate_name::types::ToJSON::to_json(&#func_name())))
+                quote!(#crate_name::types::ToJSON::to_json(&#func_name()))
             }
             None => quote!(::std::option::Option::None),
         };
 
         meta_fields.push(quote! {{
+            let original_schema = <#field_ty as #crate_name::types::Type>::schema_ref();
             let mut patch_schema = {
                 let mut schema = #crate_name::registry::MetaSchema::ANY;
                 schema.default = #field_meta_default;
-
-                if let ::std::option::Option::Some(title) = #field_title {
-                    schema.title = ::std::option::Option::Some(title);
-                }
 
                 if let ::std::option::Option::Some(field_description) = #field_description {
                     schema.description = ::std::option::Option::Some(field_description);
@@ -196,7 +176,7 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
                 schema
             };
 
-            (#field_name, <#field_ty as #crate_name::types::Type>::schema_ref().merge(patch_schema))
+            (#field_name, original_schema.merge(patch_schema))
         }});
 
         register_fields.push(quote! {
@@ -204,11 +184,34 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
         });
 
         required_fields.push(quote! {
-            if <#field_ty as #crate_name::types::Type>::IS_REQUIRED {
+            if <#field_ty as #crate_name::types::Type>::IS_REQUIRED && !#has_default {
                 fields.push(#field_name);
             }
         });
     }
+
+    let extractor_impl_generics = {
+        let mut s = quote!(#impl_generics).to_string();
+        match s.find('<') {
+            Some(pos) => {
+                s.insert_str(pos + 1, "'__request,");
+                TokenStream::from_str(&s).unwrap()
+            }
+            _ => quote!(<'__request>),
+        }
+    };
+
+    let deny_unknown_fields = if args.deny_unknown_fields {
+        Some(quote! {
+            if let ::std::option::Option::Some(name) = field.name() {
+                return ::std::result::Result::Err(::std::convert::Into::into(#crate_name::error::ParseMultipartError {
+                    reason: ::std::format!("unknown field `{}`", name),
+                }));
+            }
+        })
+    } else {
+        None
+    };
 
     let expanded = quote! {
         impl #impl_generics #crate_name::payload::Payload for #ident #ty_generics #where_clause {
@@ -233,24 +236,70 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
             }
         }
 
-        #[#crate_name::poem::async_trait]
+        #[#crate_name::__private::poem::async_trait]
         impl #impl_generics #crate_name::payload::ParsePayload for #ident #ty_generics #where_clause {
-            async fn from_request(request: &#crate_name::poem::Request, body: &mut #crate_name::poem::RequestBody) -> ::std::result::Result<Self, #crate_name::ParseRequestError> {
-                if body.is_some() {
-                    let mut multipart = <#crate_name::poem::web::Multipart as #crate_name::poem::FromRequest>::from_request(request, body).await.map_err(|err| #crate_name::ParseRequestError::ParseRequestBody {
-                        reason: ::std::string::ToString::to_string(&err),
-                    })?;
-                    #(#skip_fields)*
-                    #(let mut #fields = ::std::option::Option::None;)*
-                    while let ::std::option::Option::Some(field) = multipart.next_field().await.map_err(|err| #crate_name::ParseRequestError::ParseRequestBody { reason: ::std::string::ToString::to_string(&err) })? {
-                        #(#deserialize_fields)*
+            const IS_REQUIRED: bool = true;
+
+            async fn from_request(request: &#crate_name::__private::poem::Request, body: &mut #crate_name::__private::poem::RequestBody) -> #crate_name::__private::poem::Result<Self> {
+                let mut multipart = <#crate_name::__private::poem::web::Multipart as #crate_name::__private::poem::FromRequest>::from_request(request, body).await?;
+                #(#skip_fields)*
+                #(let mut #fields = ::std::option::Option::None;)*
+                while let ::std::option::Option::Some(field) = multipart.next_field().await? {
+                    #(#deserialize_fields)*
+                    #deny_unknown_fields
+                }
+                #(#deserialize_none)*
+                ::std::result::Result::Ok(Self { #(#fields,)* #(#skip_idents),* })
+            }
+        }
+
+        #[#crate_name::__private::poem::async_trait]
+        impl #extractor_impl_generics #crate_name::ApiExtractor<'__request> for #ident #ty_generics #where_clause {
+            const TYPE: #crate_name::ApiExtractorType = #crate_name::ApiExtractorType::RequestObject;
+
+            type ParamType = ();
+            type ParamRawType = ();
+
+            fn register(registry: &mut #crate_name::registry::Registry) {
+                <Self as #crate_name::payload::Payload>::register(registry);
+            }
+
+            fn request_meta() -> ::std::option::Option<#crate_name::registry::MetaRequest> {
+                ::std::option::Option::Some(#crate_name::registry::MetaRequest {
+                    description: ::std::option::Option::None,
+                    content: ::std::vec![#crate_name::registry::MetaMediaType {
+                        content_type: <Self as #crate_name::payload::Payload>::CONTENT_TYPE,
+                        schema: <Self as #crate_name::payload::Payload>::schema_ref(),
+                    }],
+                    required: <Self as #crate_name::payload::ParsePayload>::IS_REQUIRED,
+                })
+            }
+
+            async fn from_request(
+                request: &'__request #crate_name::__private::poem::Request,
+                body: &mut #crate_name::__private::poem::RequestBody,
+                _param_opts: #crate_name::ExtractParamOptions<Self::ParamType>,
+            ) -> #crate_name::__private::poem::Result<Self> {
+                match request.content_type() {
+                    ::std::option::Option::Some(content_type) => {
+                        let mime: #crate_name::__private::mime::Mime = match content_type.parse() {
+                            ::std::result::Result::Ok(mime) => mime,
+                            ::std::result::Result::Err(_) => {
+                                return ::std::result::Result::Err(::std::convert::Into::into(#crate_name::error::ContentTypeError::NotSupported {
+                                    content_type: ::std::string::ToString::to_string(&content_type),
+                                }));
+                            }
+                        };
+
+                        if mime.essence_str() != <Self as #crate_name::payload::Payload>::CONTENT_TYPE {
+                            return ::std::result::Result::Err(::std::convert::Into::into(#crate_name::error::ContentTypeError::NotSupported {
+                                content_type: ::std::string::ToString::to_string(&content_type),
+                            }));
+                        }
+
+                        <Self as #crate_name::payload::ParsePayload>::from_request(request, body).await
                     }
-                    #(#deserialize_none)*
-                    ::std::result::Result::Ok(Self { #(#fields,)* #(#skip_idents),* })
-                } else {
-                    ::std::result::Result::Err(#crate_name::ParseRequestError::ParseRequestBody {
-                        reason: ::std::convert::Into::into("expect request body"),
-                    })
+                    ::std::option::Option::None => ::std::result::Result::Err(::std::convert::Into::into(#crate_name::error::ContentTypeError::ExpectContentType)),
                 }
             }
         }

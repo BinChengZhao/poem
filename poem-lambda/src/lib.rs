@@ -1,17 +1,17 @@
 //! Poem for AWS Lambda.
 
-#![doc(html_favicon_url = "https://poem.rs/assets/favicon.ico")]
-#![doc(html_logo_url = "https://poem.rs/assets/logo.png")]
+#![doc(html_favicon_url = "https://raw.githubusercontent.com/poem-web/poem/master/favicon.ico")]
+#![doc(html_logo_url = "https://raw.githubusercontent.com/poem-web/poem/master/logo.png")]
 #![forbid(unsafe_code)]
 #![deny(private_in_public, unreachable_pub)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
-use std::{convert::Infallible, ops::Deref, sync::Arc};
+use std::{io::ErrorKind, ops::Deref, sync::Arc};
 
 pub use lambda_http::lambda_runtime::Error;
 use lambda_http::{handler, lambda_runtime, Body as LambdaBody, Request as LambdaRequest};
-use poem::{Body, Endpoint, EndpointExt, FromRequest, IntoEndpoint, Request, RequestBody};
+use poem::{Body, Endpoint, EndpointExt, FromRequest, IntoEndpoint, Request, RequestBody, Result};
 
 /// The Lambda function execution context.
 ///
@@ -65,14 +65,23 @@ pub async fn run(ep: impl IntoEndpoint) -> Result<(), Error> {
                 let mut req: Request = from_lambda_request(req);
                 req.extensions_mut().insert(Context(ctx));
 
-                let resp = ep.call(req).await;
+                let resp = match ep.call(req).await {
+                    Ok(resp) => resp,
+                    Err(err) => err.as_response(),
+                };
 
                 let (parts, body) = resp.into_parts();
-                let data = body.into_vec().await.map_err(Box::new)?;
+                let data = body
+                    .into_vec()
+                    .await
+                    .map_err(|_| std::io::Error::new(ErrorKind::Other, "invalid request"))?;
                 let mut lambda_resp = poem::http::Response::new(if data.is_empty() {
                     LambdaBody::Empty
                 } else {
-                    LambdaBody::Binary(data)
+                    match String::from_utf8(data) {
+                        Ok(data) => LambdaBody::Text(data),
+                        Err(err) => LambdaBody::Binary(err.into_bytes()),
+                    }
                 });
                 *lambda_resp.status_mut() = parts.status;
                 *lambda_resp.version_mut() = parts.version;
@@ -105,9 +114,7 @@ fn from_lambda_request(req: LambdaRequest) -> Request {
 
 #[poem::async_trait]
 impl<'a> FromRequest<'a> for &'a Context {
-    type Error = Infallible;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
         let ctx = match req.extensions().get::<Context>() {
             Some(ctx) => ctx,
             None => panic!("Lambda runtime is required."),

@@ -5,7 +5,7 @@ use typed_headers::{AcceptEncoding, ContentCoding, HeaderMapExt};
 use crate::{
     http::header,
     web::{Compress, CompressionAlgo},
-    Body, Endpoint, IntoResponse, Middleware, Request, Response,
+    Body, Endpoint, IntoResponse, Middleware, Request, Response, Result,
 };
 
 /// Middleware for decompress request body and compress response body.
@@ -34,6 +34,7 @@ impl<E: Endpoint> Middleware<E> for Compression {
 }
 
 /// Endpoint for Compression middleware.
+#[cfg_attr(docsrs, doc(cfg(feature = "compression")))]
 pub struct CompressionEndpoint<E: Endpoint> {
     ep: E,
 }
@@ -42,7 +43,7 @@ pub struct CompressionEndpoint<E: Endpoint> {
 impl<E: Endpoint> Endpoint for CompressionEndpoint<E> {
     type Output = Response;
 
-    async fn call(&self, mut req: Request) -> Self::Output {
+    async fn call(&self, mut req: Request) -> Result<Self::Output> {
         // decompress request body
         if let Some(algo) = req
             .headers()
@@ -70,8 +71,8 @@ impl<E: Endpoint> Endpoint for CompressionEndpoint<E> {
         }
 
         match compress_algo {
-            Some(algo) => Compress::new(self.ep.call(req).await, algo).into_response(),
-            None => self.ep.call(req).await.into_response(),
+            Some(algo) => Ok(Compress::new(self.ep.call(req).await?, algo).into_response()),
+            None => Ok(self.ep.call(req).await?.into_response()),
         }
     }
 }
@@ -100,7 +101,8 @@ mod tests {
                     .header("Accept-Encoding", algo.as_str())
                     .body(Body::from_async_read(algo.compress(DATA.as_bytes()))),
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(
             resp.headers()
@@ -131,7 +133,8 @@ mod tests {
                     .header("Accept-Encoding", "identity; q=0.5, gzip;q=1.0, br;q=0.3")
                     .body(DATA),
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(
             resp.headers()
@@ -155,7 +158,8 @@ mod tests {
                     .header("Accept-Encoding", "identity; q=0.5, *;q=1.0, br;q=0.3")
                     .body(DATA),
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(
             resp.headers()

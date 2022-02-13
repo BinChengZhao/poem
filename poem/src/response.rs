@@ -1,6 +1,5 @@
 use std::{
     any::Any,
-    convert::TryInto,
     fmt::{self, Debug, Formatter},
 };
 
@@ -12,7 +11,7 @@ use crate::{
         Extensions, StatusCode, Version,
     },
     web::headers::Header,
-    Body, Error,
+    Body,
 };
 
 /// Component parts of an HTTP Response.
@@ -69,12 +68,6 @@ impl<T: Into<Body>> From<T> for Response {
 impl From<StatusCode> for Response {
     fn from(status: StatusCode) -> Self {
         Response::builder().status(status).finish()
-    }
-}
-
-impl From<Error> for Response {
-    fn from(err: Error) -> Self {
-        err.as_response()
     }
 }
 
@@ -136,6 +129,12 @@ impl Response {
         self.status
     }
 
+    /// Returns `true` if status code is [`StatusCode::OK`].
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        self.status() == StatusCode::OK
+    }
+
     /// Check if status is within 200-299.
     #[inline]
     pub fn is_success(&self) -> bool {
@@ -167,6 +166,15 @@ impl Response {
         &mut self.headers
     }
 
+    /// Returns the string value of the specified header.
+    ///
+    /// NOTE: Returns `None` if the header value is not a valid UTF8 string.
+    pub fn header(&self, name: impl AsRef<str>) -> Option<&str> {
+        self.headers
+            .get(name.as_ref())
+            .and_then(|value| value.to_str().ok())
+    }
+
     /// Returns the associated version.
     #[inline]
     pub fn version(&self) -> Version {
@@ -189,6 +197,19 @@ impl Response {
     #[inline]
     pub fn extensions_mut(&mut self) -> &mut Extensions {
         &mut self.extensions
+    }
+
+    /// Get a reference from extensions, similar to `self.extensions().get()`.
+    #[inline]
+    pub fn data<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.extensions.get()
+    }
+
+    /// Inserts a value to extensions, similar to
+    /// `self.extensions().insert(data)`.
+    #[inline]
+    pub fn set_data(&mut self, data: impl Send + Sync + 'static) {
+        self.extensions.insert(data);
     }
 
     /// Sets the body for this response.
@@ -320,11 +341,6 @@ mod tests {
         let resp = Response::from(StatusCode::BAD_GATEWAY);
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert!(resp.body.into_string().await.unwrap().is_empty());
-
-        let resp =
-            Response::from(Error::new(StatusCode::BAD_GATEWAY).with_reason_string("bad gateway"));
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(resp.body.into_string().await.unwrap(), "bad gateway");
 
         let resp = Response::from((StatusCode::BAD_GATEWAY, Body::from("abc")));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);

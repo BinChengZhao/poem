@@ -4,8 +4,8 @@ use darling::{
     FromDeriveInput, FromField, FromVariant,
 };
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::{format_ident, quote};
-use syn::{Attribute, DeriveInput, Error, Generics, Type};
+use quote::quote;
+use syn::{Attribute, DeriveInput, Error, Generics, Path, Type};
 
 use crate::{
     error::GeneratorResult,
@@ -13,14 +13,15 @@ use crate::{
 };
 
 #[derive(FromField)]
-#[darling(attributes(oai))]
+#[darling(attributes(oai), forward_attrs(doc))]
 struct ResponseField {
     ty: Type,
+    attrs: Vec<Attribute>,
 
     #[darling(default)]
     header: Option<String>,
     #[darling(default)]
-    desc: Option<String>,
+    deprecated: bool,
 }
 
 #[derive(FromVariant)]
@@ -32,6 +33,8 @@ struct ResponseItem {
 
     #[darling(default)]
     status: Option<u16>,
+    #[darling(default)]
+    content_type: Option<String>,
 }
 
 #[derive(FromDeriveInput)]
@@ -44,7 +47,7 @@ struct ResponseArgs {
     #[darling(default)]
     internal: bool,
     #[darling(default)]
-    bad_request_handler: Option<String>,
+    bad_request_handler: Option<Path>,
 }
 
 pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
@@ -69,22 +72,23 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
         let item_ident = &variant.ident;
         let item_description = get_description(&variant.attrs)?;
         let item_description = optional_literal(&item_description);
-        let (values, headers) = parse_fields(&variant.fields);
+        let (values, headers) = parse_fields(&variant.fields)?;
 
         let mut match_headers = Vec::new();
         let mut with_headers = Vec::new();
         let mut meta_headers = Vec::new();
 
+        // headers
         for (idx, header) in headers.iter().enumerate() {
             let ident = quote::format_ident!("__p{}", idx);
             let header_name = header.header.as_ref().unwrap().to_uppercase();
             let header_ty = &header.ty;
-            let header_desc = optional_literal(&header.desc);
+            let header_desc = optional_literal(&get_description(&header.attrs)?);
+            let deprecated = header.deprecated;
 
             with_headers.push(quote! {{
-                let value = ::std::string::ToString::to_string(&#ident);
-                if let ::std::result::Result::Ok(value) = ::std::convert::TryInto::try_into(value) {
-                    resp.headers_mut().insert(#header_name, value);
+                if let Some(header) = #crate_name::types::ToHeader::to_header(&#ident) {
+                    resp.headers_mut().insert(#header_name, header);
                 }
             }});
             match_headers.push(ident);
@@ -93,101 +97,118 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
                     name: #header_name,
                     description: #header_desc,
                     required: <#header_ty as #crate_name::types::Type>::IS_REQUIRED,
+                    deprecated: #deprecated,
                     schema: <#header_ty as #crate_name::types::Type>::schema_ref(),
                 }
             });
         }
 
+        fn update_content_type(
+            crate_name: &TokenStream,
+            content_type: Option<&str>,
+        ) -> (TokenStream, TokenStream) {
+            let update_response_content_type = match content_type {
+                Some(content_type) => {
+                    quote! {
+                        resp.headers_mut().insert(#crate_name::__private::poem::http::header::CONTENT_TYPE,
+                            #crate_name::__private::poem::http::HeaderValue::from_static(#content_type));
+                    }
+                }
+                None => quote!(),
+            };
+
+            let update_meta_content_type = match content_type {
+                Some(content_type) => quote! {
+                    if let Some(mt) = content.get_mut(0) {
+                        mt.content_type = #content_type;
+                    }
+                },
+                None => quote!(),
+            };
+
+            (update_response_content_type, update_meta_content_type)
+        }
+
         match values.len() {
             2 => {
-                // #[oai(default)]
-                // Item(StatusCode, payload)
-                let payload_ty = &values[1].ty;
+                // Item(StatusCode, media)
+                let media_ty = &values[1].ty;
+                let (update_response_content_type, update_meta_content_type) =
+                    update_content_type(&crate_name, variant.content_type.as_deref());
                 into_responses.push(quote! {
-                    #ident::#item_ident(status, payload, #(#match_headers),*) => {
-                        let mut resp = #crate_name::poem::IntoResponse::into_response(payload);
+                    #ident::#item_ident(status, media, #(#match_headers),*) => {
+                        let mut resp = #crate_name::__private::poem::IntoResponse::into_response(media);
                         resp.set_status(status);
                         #(#with_headers)*
+                        #update_response_content_type
                         resp
                     }
                 });
                 responses_meta.push(quote! {
                     #crate_name::registry::MetaResponse {
-                        description: #item_description,
+                        description: #item_description.unwrap_or_default(),
                         status: ::std::option::Option::None,
-                        content: ::std::vec![#crate_name::registry::MetaMediaType {
-                            content_type: <#payload_ty as #crate_name::payload::Payload>::CONTENT_TYPE,
-                            schema: <#payload_ty as #crate_name::payload::Payload>::schema_ref(),
-                        }],
+                        content: {
+                            let mut content = <#media_ty as #crate_name::ResponseContent>::media_types();
+                            #update_meta_content_type
+                            content
+                        },
                         headers: ::std::vec![#(#meta_headers),*],
                     }
                 });
-                schemas.push(payload_ty);
+                schemas.push(media_ty);
             }
             1 => {
                 // #[oai(status = 200)]
-                // Item(payload)
-                let payload_ty = &values[0].ty;
+                // Item(media)
+                let media_ty = &values[0].ty;
                 let status = get_status(variant.ident.span(), variant.status)?;
+                let (update_response_content_type, update_meta_content_type) =
+                    update_content_type(&crate_name, variant.content_type.as_deref());
                 into_responses.push(quote! {
-                    #ident::#item_ident(payload, #(#match_headers),*) => {
-                        let mut resp = #crate_name::poem::IntoResponse::into_response(payload);
-                        resp.set_status(#crate_name::poem::http::StatusCode::from_u16(#status).unwrap());
+                    #ident::#item_ident(media, #(#match_headers),*) => {
+                        let mut resp = #crate_name::__private::poem::IntoResponse::into_response(media);
+                        resp.set_status(#crate_name::__private::poem::http::StatusCode::from_u16(#status).unwrap());
                         #(#with_headers)*
+                        #update_response_content_type
                         resp
                     }
                 });
                 responses_meta.push(quote! {
                     #crate_name::registry::MetaResponse {
-                        description: #item_description,
+                        description: #item_description.unwrap_or_default(),
                         status: ::std::option::Option::Some(#status),
-                        content: ::std::vec![#crate_name::registry::MetaMediaType {
-                            content_type: <#payload_ty as #crate_name::payload::Payload>::CONTENT_TYPE,
-                            schema: <#payload_ty as #crate_name::payload::Payload>::schema_ref(),
-                        }],
+                        content: {
+                            let mut content = <#media_ty as #crate_name::ResponseContent>::media_types();
+                            #update_meta_content_type
+                            content
+                        },
                         headers: ::std::vec![#(#meta_headers),*],
                     }
                 });
-                schemas.push(payload_ty);
-            }
-            0 if headers.is_empty() => {
-                // #[oai(status = 200)]
-                // Item
-                let status = get_status(variant.ident.span(), variant.status)?;
-                into_responses.push(quote! {
-                    #ident::#item_ident => {
-                        let status = #crate_name::poem::http::StatusCode::from_u16(#status).unwrap();
-                        #[allow(unused_mut)]
-                        let mut resp = #crate_name::poem::IntoResponse::into_response(status);
-                        #(#with_headers)*
-                        resp
-                    }
-                });
-                responses_meta.push(quote! {
-                    #crate_name::registry::MetaResponse {
-                        description: #item_description,
-                        status: ::std::option::Option::Some(#status),
-                        content: ::std::vec![],
-                        headers: ::std::vec![#(#meta_headers),*],
-                    }
-                });
+                schemas.push(media_ty);
             }
             0 => {
                 // #[oai(status = 200)]
                 // Item
                 let status = get_status(variant.ident.span(), variant.status)?;
+                let item = if !headers.is_empty() {
+                    quote!(#ident::#item_ident(#(#match_headers),*))
+                } else {
+                    quote!(#ident::#item_ident)
+                };
                 into_responses.push(quote! {
-                    #ident::#item_ident(#(#match_headers),*) => {
-                        let status = #crate_name::poem::http::StatusCode::from_u16(#status).unwrap();
+                    #item => {
+                        let status = #crate_name::__private::poem::http::StatusCode::from_u16(#status).unwrap();
                         #[allow(unused_mut)]
-                        let mut resp = #crate_name::poem::IntoResponse::into_response(status);
+                        let mut resp = #crate_name::__private::poem::IntoResponse::into_response(status);
                         #(#with_headers)*
                         resp
                     }
                 });
                 responses_meta.push(quote! {
                     #crate_name::registry::MetaResponse {
-                        description: #item_description,
+                        description: #item_description.unwrap_or_default(),
                         status: ::std::option::Option::Some(#status),
                         content: ::std::vec![],
                         headers: ::std::vec![#(#meta_headers),*],
@@ -210,22 +231,18 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
             const BAD_REQUEST_HANDLER: bool = false;
         ),
     };
-    let bad_request_handler = match &args.bad_request_handler {
-        Some(name) => {
-            let name = format_ident!("{}", name);
-            Some(quote! {
-                fn from_parse_request_error(err: #crate_name::ParseRequestError) -> Self {
-                    #name(err)
-                }
-            })
+    let bad_request_handler = args.bad_request_handler.as_ref().map(|path| {
+        quote! {
+            fn from_parse_request_error(err: #crate_name::__private::poem::Error) -> Self {
+                #path(err)
+            }
         }
-        None => None,
-    };
+    });
 
     let expanded = {
         quote! {
-            impl #impl_generics #crate_name::poem::IntoResponse for #ident #ty_generics #where_clause {
-                fn into_response(self) -> #crate_name::poem::Response {
+            impl #impl_generics #crate_name::__private::poem::IntoResponse for #ident #ty_generics #where_clause {
+                fn into_response(self) -> #crate_name::__private::poem::Response {
                     match self {
                         #(#into_responses)*
                     }
@@ -237,12 +254,12 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
 
                 fn meta() -> #crate_name::registry::MetaResponses {
                     #crate_name::registry::MetaResponses {
-                        responses: ::std::vec![#(#responses_meta),*],
+                        responses: ::std::vec![#(#responses_meta),*]
                     }
                 }
 
                 fn register(registry: &mut #crate_name::registry::Registry) {
-                    #(<#schemas as #crate_name::payload::Payload>::register(registry);)*
+                    #(<#schemas as #crate_name::ResponseContent>::register(registry);)*
                 }
 
                 #bad_request_handler
@@ -254,8 +271,7 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
 }
 
 fn get_status(span: Span, status: Option<u16>) -> GeneratorResult<TokenStream> {
-    let status =
-        status.ok_or_else(|| Error::new(span, "Response can only be applied to an enum."))?;
+    let status = status.ok_or_else(|| Error::new(span, "Missing status attribute"))?;
     if !(100..1000).contains(&status) {
         return Err(Error::new(
             span,
@@ -266,7 +282,9 @@ fn get_status(span: Span, status: Option<u16>) -> GeneratorResult<TokenStream> {
     Ok(quote!(#status))
 }
 
-fn parse_fields(fields: &Fields<ResponseField>) -> (Vec<&ResponseField>, Vec<&ResponseField>) {
+fn parse_fields(
+    fields: &Fields<ResponseField>,
+) -> syn::Result<(Vec<&ResponseField>, Vec<&ResponseField>)> {
     let mut values = Vec::new();
     let mut headers = Vec::new();
 
@@ -278,5 +296,5 @@ fn parse_fields(fields: &Fields<ResponseField>) -> (Vec<&ResponseField>, Vec<&Re
         }
     }
 
-    (values, headers)
+    Ok((values, headers))
 }

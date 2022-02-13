@@ -1,10 +1,15 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use redis::{aio::ConnectionLike, AsyncCommands, Cmd};
+use serde_json::Value;
 
-use crate::{session::session_storage::SessionStorage, Error, Result};
+use crate::{error::InternalServerError, session::session_storage::SessionStorage, Result};
 
 /// A session storage using redis.
+///
+/// # Errors
+///
+/// - [`redis::RedisError`]
 #[cfg_attr(docsrs, doc(cfg(feature = "redis-session")))]
 pub struct RedisStorage<T> {
     connection: T,
@@ -19,20 +24,26 @@ impl<T> RedisStorage<T> {
 
 #[async_trait::async_trait]
 impl<T: ConnectionLike + Clone + Sync + Send> SessionStorage for RedisStorage<T> {
-    async fn load_session(&self, session_id: &str) -> Result<BTreeMap<String, String>> {
-        let data: String = self
+    async fn load_session(&self, session_id: &str) -> Result<Option<BTreeMap<String, Value>>> {
+        let data: Option<String> = self
             .connection
             .clone()
             .get(session_id)
             .await
-            .map_err(Error::internal_server_error)?;
-        Ok(serde_json::from_str::<BTreeMap<String, String>>(&data).unwrap_or_default())
+            .map_err(InternalServerError)?;
+        match data {
+            Some(data) => match serde_json::from_str::<BTreeMap<String, Value>>(&data) {
+                Ok(entries) => Ok(Some(entries)),
+                Err(_) => Ok(None),
+            },
+            None => Ok(None),
+        }
     }
 
     async fn update_session(
         &self,
         session_id: &str,
-        entries: &BTreeMap<String, String>,
+        entries: &BTreeMap<String, Value>,
         expires: Option<Duration>,
     ) -> Result<()> {
         let value = serde_json::to_string(entries).unwrap_or_default();
@@ -42,7 +53,7 @@ impl<T: ConnectionLike + Clone + Sync + Send> SessionStorage for RedisStorage<T>
         };
         cmd.query_async(&mut self.connection.clone())
             .await
-            .map_err(Error::internal_server_error)?;
+            .map_err(InternalServerError)?;
         Ok(())
     }
 
@@ -50,14 +61,14 @@ impl<T: ConnectionLike + Clone + Sync + Send> SessionStorage for RedisStorage<T>
         Cmd::del(session_id)
             .query_async(&mut self.connection.clone())
             .await
-            .map_err(Error::internal_server_error)?;
+            .map_err(InternalServerError)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use redis::{aio::ConnectionManager, Client};
+    use redis::{aio::ConnectionManager, Client, ConnectionLike};
 
     use super::*;
     use crate::{
@@ -70,7 +81,14 @@ mod tests {
 
     #[tokio::test]
     async fn redis_session() {
-        let client = Client::open("redis://127.0.0.1/").unwrap();
+        let mut client = match Client::open("redis://127.0.0.1/") {
+            Ok(client) => client,
+            Err(_) => return,
+        };
+        if !client.check_connection() {
+            return;
+        }
+
         let app = Route::new().at("/:action", index).with(ServerSession::new(
             CookieConfig::default(),
             RedisStorage::new(ConnectionManager::new(client).await.unwrap()),

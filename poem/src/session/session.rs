@@ -1,14 +1,14 @@
 use std::{
     collections::BTreeMap,
-    convert::Infallible,
     fmt::{self, Debug, Formatter},
     sync::Arc,
 };
 
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
 
-use crate::{FromRequest, Request, RequestBody};
+use crate::{FromRequest, Request, RequestBody, Result};
 
 /// Status of the Session.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -28,7 +28,7 @@ pub enum SessionStatus {
 
 struct SessionInner {
     status: SessionStatus,
-    entries: BTreeMap<String, String>,
+    entries: BTreeMap<String, Value>,
 }
 
 /// Session
@@ -57,7 +57,7 @@ impl Session {
     /// Creates a new session instance.
     ///
     /// The default status is [`SessionStatus::Unchanged`].
-    pub(crate) fn new(entries: BTreeMap<String, String>) -> Self {
+    pub(crate) fn new(entries: BTreeMap<String, Value>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(SessionInner {
                 status: SessionStatus::Unchanged,
@@ -72,17 +72,18 @@ impl Session {
         inner
             .entries
             .get(name)
-            .and_then(|value| serde_json::from_str(value).ok())
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
     }
 
     /// Sets a key-value pair into the session.
     pub fn set(&self, name: &str, value: impl Serialize) {
         let mut inner = self.inner.write();
-
         if inner.status != SessionStatus::Purged {
-            if let Ok(value) = serde_json::to_string(&value) {
+            if let Ok(value) = serde_json::to_value(&value) {
                 inner.entries.insert(name.to_string(), value);
-                inner.status = SessionStatus::Changed;
+                if inner.status != SessionStatus::Renewed {
+                    inner.status = SessionStatus::Changed;
+                }
             }
         }
     }
@@ -92,7 +93,9 @@ impl Session {
         let mut inner = self.inner.write();
         if inner.status != SessionStatus::Purged {
             inner.entries.remove(name);
-            inner.status = SessionStatus::Changed;
+            if inner.status != SessionStatus::Renewed {
+                inner.status = SessionStatus::Changed;
+            }
         }
     }
 
@@ -104,7 +107,7 @@ impl Session {
     }
 
     /// Get all raw key-value data from the session
-    pub fn entries(&self) -> BTreeMap<String, String> {
+    pub fn entries(&self) -> BTreeMap<String, Value> {
         let inner = self.inner.read();
         inner.entries.clone()
     }
@@ -114,14 +117,18 @@ impl Session {
         let mut inner = self.inner.write();
         if inner.status != SessionStatus::Purged {
             inner.entries.clear();
-            inner.status = SessionStatus::Changed;
+            if inner.status != SessionStatus::Renewed {
+                inner.status = SessionStatus::Changed;
+            }
         }
     }
 
     /// Renews the session key, assigning existing session state to new key.
     pub fn renew(&self) {
         let mut inner = self.inner.write();
-        inner.status = SessionStatus::Renewed;
+        if inner.status != SessionStatus::Purged {
+            inner.status = SessionStatus::Renewed;
+        }
     }
 
     /// Removes session both client and server side.
@@ -142,12 +149,87 @@ impl Session {
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for &'a Session {
-    type Error = Infallible;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
         Ok(req
             .extensions()
             .get::<Session>()
             .expect("To use the `Session` extractor, the `CookieSession` middleware is required."))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_session() {
+        let session = Session::default();
+        session.set("a", 1);
+
+        assert_eq!(session.status(), SessionStatus::Changed);
+        assert_eq!(
+            session.entries().into_iter().collect::<Vec<_>>(),
+            vec![("a".to_string(), 1.into())]
+        );
+
+        session.set("b", 2);
+        assert_eq!(session.status(), SessionStatus::Changed);
+        assert_eq!(
+            session.entries().into_iter().collect::<Vec<_>>(),
+            vec![("a".to_string(), 1.into()), ("b".to_string(), 2.into())]
+        );
+
+        session.renew();
+        session.set("c", 3);
+        assert_eq!(session.status(), SessionStatus::Renewed);
+        assert_eq!(
+            session.entries().into_iter().collect::<Vec<_>>(),
+            vec![
+                ("a".to_string(), 1.into()),
+                ("b".to_string(), 2.into()),
+                ("c".to_string(), 3.into())
+            ]
+        );
+
+        session.remove("c");
+        assert_eq!(session.status(), SessionStatus::Renewed);
+        assert_eq!(
+            session.entries().into_iter().collect::<Vec<_>>(),
+            vec![("a".to_string(), 1.into()), ("b".to_string(), 2.into()),]
+        );
+
+        session.clear();
+        assert_eq!(session.status(), SessionStatus::Renewed);
+        assert_eq!(session.entries().into_iter().collect::<Vec<_>>(), vec![]);
+    }
+
+    #[test]
+    fn purge_session() {
+        let session = Session::default();
+
+        session.set("a", 1);
+        session.set("b", 2);
+        assert_eq!(session.status(), SessionStatus::Changed);
+        assert_eq!(
+            session.entries().into_iter().collect::<Vec<_>>(),
+            vec![("a".to_string(), 1.into()), ("b".to_string(), 2.into())]
+        );
+
+        session.purge();
+        session.set("c", 3);
+        assert_eq!(session.status(), SessionStatus::Purged);
+        assert_eq!(session.entries().into_iter().collect::<Vec<_>>(), vec![]);
+
+        session.clear();
+        assert_eq!(session.status(), SessionStatus::Purged);
+        assert_eq!(session.entries().into_iter().collect::<Vec<_>>(), vec![]);
+
+        session.set("d", 4);
+        assert_eq!(session.status(), SessionStatus::Purged);
+        assert_eq!(session.entries().into_iter().collect::<Vec<_>>(), vec![]);
+
+        session.remove("d");
+        assert_eq!(session.status(), SessionStatus::Purged);
+        assert_eq!(session.entries().into_iter().collect::<Vec<_>>(), vec![]);
     }
 }

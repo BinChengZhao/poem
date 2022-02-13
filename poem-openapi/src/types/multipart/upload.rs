@@ -1,4 +1,7 @@
-use std::fmt::{self, Debug, Formatter};
+use std::{
+    borrow::Cow,
+    fmt::{self, Debug, Formatter},
+};
 
 use poem::web::Field as PoemField;
 use tokio::{
@@ -7,8 +10,8 @@ use tokio::{
 };
 
 use crate::{
-    registry::MetaSchemaRef,
-    types::{ParseError, ParseFromMultipartField, ParseResult, Type, TypeName},
+    registry::{MetaSchema, MetaSchemaRef},
+    types::{ParseError, ParseFromMultipartField, ParseResult, Type},
 };
 
 /// A uploaded file for multipart.
@@ -70,16 +73,29 @@ impl Upload {
 }
 
 impl Type for Upload {
-    const NAME: TypeName = TypeName::Normal {
-        ty: "string",
-        format: Some("binary"),
-    };
+    const IS_REQUIRED: bool = true;
 
-    fn schema_ref() -> MetaSchemaRef {
-        MetaSchemaRef::Inline(Box::new(Self::NAME.into()))
+    type RawValueType = Self;
+
+    type RawElementValueType = Self;
+
+    fn name() -> Cow<'static, str> {
+        "string(binary)".into()
     }
 
-    impl_value_type!();
+    fn schema_ref() -> MetaSchemaRef {
+        MetaSchemaRef::Inline(Box::new(MetaSchema::new_with_format("string", "binary")))
+    }
+
+    fn as_raw_value(&self) -> Option<&Self::RawValueType> {
+        Some(self)
+    }
+
+    fn raw_element_iter<'a>(
+        &'a self,
+    ) -> Box<dyn Iterator<Item = &'a Self::RawElementValueType> + 'a> {
+        Box::new(self.as_raw_value().into_iter())
+    }
 }
 
 #[poem::async_trait]

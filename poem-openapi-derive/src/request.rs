@@ -1,8 +1,11 @@
+use std::str::FromStr;
+
 use darling::{
     ast::{Data, Fields},
-    util::Ignored,
+    util::{Ignored, SpannedValue},
     FromDeriveInput, FromVariant,
 };
+use mime::Mime;
 use proc_macro2::{Ident, TokenStream};
 use quote::quote;
 use syn::{Attribute, DeriveInput, Error, Generics, Type};
@@ -17,6 +20,9 @@ use crate::{
 struct RequestItem {
     ident: Ident,
     fields: Fields<Type>,
+
+    #[darling(default)]
+    content_type: Option<SpannedValue<String>>,
 }
 
 #[derive(FromDeriveInput)]
@@ -49,6 +55,17 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
     let mut content = Vec::new();
     let mut schemas = Vec::new();
 
+    let impl_generics = {
+        let mut s = quote!(#impl_generics).to_string();
+        match s.find('<') {
+            Some(pos) => {
+                s.insert_str(pos + 1, "'__request,");
+                TokenStream::from_str(&s).unwrap()
+            }
+            _ => quote!(<'__request>),
+        }
+    };
+
     for variant in e {
         let item_ident = &variant.ident;
 
@@ -56,16 +73,29 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
             1 => {
                 // Item(payload)
                 let payload_ty = &variant.fields.fields[0];
+                let content_type = match &variant.content_type {
+                    Some(content_type) => {
+                        if !matches!(Mime::from_str(content_type), Ok(mime) if mime.params().count() == 0)
+                        {
+                            return Err(Error::new(content_type.span(), "Invalid mime type").into());
+                        }
+                        let content_type = &**content_type;
+                        quote!(#content_type)
+                    }
+                    None => quote!(<#payload_ty as #crate_name::payload::Payload>::CONTENT_TYPE),
+                };
                 from_requests.push(quote! {
-                    ::std::option::Option::Some(<#payload_ty as #crate_name::payload::Payload>::CONTENT_TYPE) => {
-                        ::std::result::Result::Ok(#ident::#item_ident(
-                            <#payload_ty as #crate_name::payload::ParsePayload>::from_request(request, body).await?
-                        ))
+                    if let ::std::result::Result::Ok(content_type2) = #crate_name::__private::mime::Mime::from_str(#content_type) {
+                        if content_type2 == content_type  {
+                            return ::std::result::Result::Ok(#ident::#item_ident(
+                                <#payload_ty as #crate_name::payload::ParsePayload>::from_request(request, body).await?
+                            ));
+                        }
                     }
                 });
                 content.push(quote! {
                     #crate_name::registry::MetaMediaType {
-                        content_type: <#payload_ty as #crate_name::payload::Payload>::CONTENT_TYPE,
+                        content_type: #content_type,
                         schema: <#payload_ty as #crate_name::payload::Payload>::schema_ref(),
                     }
                 });
@@ -81,28 +111,43 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
 
     let expanded = {
         quote! {
-            #[#crate_name::poem::async_trait]
-            impl #impl_generics #crate_name::ApiRequest for #ident #ty_generics #where_clause {
-                fn meta() -> #crate_name::registry::MetaRequest {
-                    #crate_name::registry::MetaRequest {
-                        description: #description,
-                        content: ::std::vec![#(#content),*],
-                        required: true,
-                    }
-                }
+            #[#crate_name::__private::poem::async_trait]
+            impl #impl_generics #crate_name::ApiExtractor<'__request> for #ident #ty_generics #where_clause {
+                const TYPE: #crate_name::ApiExtractorType = #crate_name::ApiExtractorType::RequestObject;
+
+                type ParamType = ();
+                type ParamRawType = ();
 
                 fn register(registry: &mut #crate_name::registry::Registry) {
                     #(<#schemas as #crate_name::payload::Payload>::register(registry);)*
                 }
 
-                async fn from_request(request: &#crate_name::poem::Request, body: &mut #crate_name::poem::RequestBody) -> ::std::result::Result<Self, #crate_name::ParseRequestError> {
-                    let content_type = request.content_type();
-                    match content_type {
-                        #(#from_requests)*
-                        ::std::option::Option::Some(content_type) => ::std::result::Result::Err(#crate_name::ParseRequestError::ContentTypeNotSupported {
-                            content_type: ::std::string::ToString::to_string(content_type),
-                        }),
-                        ::std::option::Option::None => ::std::result::Result::Err(#crate_name::ParseRequestError::ExpectContentType),
+                fn request_meta() -> ::std::option::Option<#crate_name::registry::MetaRequest> {
+                    ::std::option::Option::Some(#crate_name::registry::MetaRequest {
+                        description: #description,
+                        content: ::std::vec![#(#content),*],
+                        required: true,
+                    })
+                }
+
+                async fn from_request(
+                    request: &'__request #crate_name::__private::poem::Request,
+                    body: &mut #crate_name::__private::poem::RequestBody,
+                    _param_opts: #crate_name::ExtractParamOptions<Self::ParamType>,
+                ) -> #crate_name::__private::poem::Result<Self> {
+                    use ::std::str::FromStr;
+
+                    match request.content_type() {
+                        ::std::option::Option::Some(content_type) => {
+                            #(#from_requests)*
+                            ::std::result::Result::Err(
+                                ::std::convert::Into::into(#crate_name::error::ContentTypeError::NotSupported {
+                                    content_type: ::std::string::ToString::to_string(content_type),
+                            }))
+                        }
+                        ::std::option::Option::None => {
+                            ::std::result::Result::Err(::std::convert::Into::into(#crate_name::error::ContentTypeError::ExpectContentType))
+                        }
                     }
                 }
             }

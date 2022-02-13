@@ -1,8 +1,8 @@
 [package]
 name = "poem-derive"
-version = "1.0.3"
+version = "1.2.57"
 authors = ["sunli <scott_s829@163.com>"]
-edition = "2018"
+edition = "2021"
 description = "Macros for poem"
 license = "MIT/Apache-2.0"
 documentation = "https://docs.rs/poem/"
@@ -20,7 +20,6 @@ categories = [
 proc-macro = true
 
 [dependencies]
-darling = "0.13.0"
 proc-macro-crate = "1.1.0"
 proc-macro2 = "1.0.29"
 quote = "1.0.9"

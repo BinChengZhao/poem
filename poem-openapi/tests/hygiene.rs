@@ -39,10 +39,10 @@ enum CreateUserResponse {
     BadRequest(::poem_openapi::payload::PlainText<::std::string::String>),
 }
 
-fn bad_request_handler(err: ::poem_openapi::ParseRequestError) -> CreateUserResponse {
+fn bad_request_handler(err: ::poem::Error) -> CreateUserResponse {
     CreateUserResponse::BadRequest(::poem_openapi::payload::PlainText(::std::format!(
         "error: {}",
-        err
+        ::std::string::ToString::to_string(&err)
     )))
 }
 
@@ -65,9 +65,10 @@ impl Api {
     #[allow(unused_variables)]
     async fn create_user(
         &self,
-        #[oai(name = "key", in = "query", desc = "api key")] key: ::std::string::String,
-        #[oai(name = "X-API-TOKEN", in = "header", deprecated)] api_token: ::std::option::Option<
-            ::std::string::String,
+        /// api key key: poem_openapi::param::Query<::std::string::String>,
+        #[oai(name = "X-API-TOKEN", deprecated)]
+        api_token: poem_openapi::param::Header<
+            ::std::option::Option<::std::string::String>,
         >,
         req: CreateUserRequest,
     ) -> CreateUserResponse {
@@ -106,7 +107,7 @@ impl Api {
 #[oai(rename_all = "UPPERCASE")]
 struct A {
     name: ::std::string::String,
-    file: ::poem_openapi::types::Binary,
+    file: ::poem_openapi::types::Binary<::std::vec::Vec<u8>>,
 }
 
 #[derive(::poem_openapi::Object, Debug, PartialEq)]
@@ -120,9 +121,15 @@ struct B1 {
     v3: f32,
 }
 
-#[derive(::poem_openapi::OneOf, Debug, PartialEq)]
-#[oai(property_name = "type")]
-enum MyOneOf {
+#[derive(::poem_openapi::Union, Debug, PartialEq)]
+#[oai(discriminator_name = "type")]
+enum MyAnyOf1 {
+    A(A1),
+    B(B1),
+}
+
+#[derive(::poem_openapi::Union, Debug, PartialEq)]
+enum MyAnyOf2 {
     A(A1),
     B(B1),
 }

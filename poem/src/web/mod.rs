@@ -1,5 +1,6 @@
 //! Commonly used as the type of extractor or response.
 
+mod addr;
 #[cfg(feature = "compression")]
 mod compress;
 #[cfg(feature = "cookie")]
@@ -13,35 +14,41 @@ mod multipart;
 mod path;
 mod query;
 mod redirect;
-mod remote_addr;
 #[cfg(feature = "sse")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sse")))]
 pub mod sse;
+#[cfg(feature = "static-files")]
+mod static_file;
 #[cfg(feature = "tempfile")]
 mod tempfile;
-mod template;
 #[doc(inline)]
 pub use headers;
+#[cfg(feature = "csrf")]
+mod csrf;
 mod typed_header;
 #[cfg(feature = "websocket")]
 #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
 pub mod websocket;
 
-use std::convert::{Infallible, TryInto};
+use std::{convert::Infallible, fmt::Debug};
 
+pub use addr::{LocalAddr, RemoteAddr};
 use bytes::Bytes;
 #[cfg(feature = "compression")]
 pub use compress::{Compress, CompressionAlgo};
+#[cfg(feature = "csrf")]
+pub use csrf::{CsrfToken, CsrfVerifier};
 pub use data::Data;
 pub use form::Form;
 pub use json::Json;
 #[cfg(feature = "multipart")]
 pub use multipart::{Field, Multipart};
 pub use path::Path;
+pub(crate) use path::PathDeserializer;
 pub use query::Query;
 pub use redirect::Redirect;
-pub use remote_addr::RemoteAddr;
-pub use template::{HtmlTemplate, Template};
+#[cfg(feature = "static-files")]
+pub use static_file::{StaticFileRequest, StaticFileResponse};
 pub use typed_header::TypedHeader;
 
 #[cfg(feature = "tempfile")]
@@ -99,9 +106,13 @@ impl RequestBody {
 ///
 ///    Extracts the [`Request`] from the incoming request.
 ///
-/// - **RemoteAddr**
+/// - **&RemoteAddr**
 ///
 ///    Extracts the remote peer's address [`RemoteAddr`] from request.
+///
+/// - **&LocalAddr**
+///
+///    Extracts the local server's address [`LocalAddr`] from request.
 ///
 /// - **Method**
 ///
@@ -209,51 +220,39 @@ impl RequestBody {
 ///    Ready to accept a websocket [`WebSocket`](websocket::WebSocket)
 /// connection.
 ///
-/// # Custom extractor
+/// - **Locale**
+///
+///    Extracts the [`Locale`](crate::i18n::Locale) from the incoming
+/// request.
+///
+/// - **StaticFileRequest**
+///
+///     Ready to accept a static file request
+/// [`StaticFileRequest`](static_file::StaticFileRequest).
+///
+/// # Create your own extractor
 ///
 /// The following is an example of a custom token extractor, which extracts the
 /// token from the `MyToken` header.
 ///
 /// ```
-/// use std::{
-///     error::Error as StdError,
-///     fmt::{self, Display, Formatter},
-/// };
+/// use std::fmt::{self, Display, Formatter};
 ///
-/// use poem::{get, handler, Endpoint, Error, FromRequest, Request, RequestBody, Route};
+/// use poem::{
+///     get, handler, http::StatusCode, Endpoint, Error, FromRequest, Request, RequestBody, Result,
+///     Route,
+/// };
 ///
 /// struct Token(String);
 ///
-/// #[derive(Debug)]
-/// struct MissingToken;
-///
-/// impl Display for MissingToken {
-///     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-///         write!(f, "missing token")
-///     }
-/// }
-///
-/// impl StdError for MissingToken {}
-///
-/// impl From<MissingToken> for Error {
-///     fn from(err: MissingToken) -> Self {
-///         Error::bad_request(err)
-///     }
-/// }
-///
 /// #[poem::async_trait]
 /// impl<'a> FromRequest<'a> for Token {
-///     type Error = MissingToken;
-///
-///     async fn from_request(
-///         req: &'a Request,
-///         body: &mut RequestBody,
-///     ) -> Result<Self, Self::Error> {
+///     async fn from_request(req: &'a Request, body: &mut RequestBody) -> Result<Self> {
 ///         let token = req
 ///             .headers()
 ///             .get("MyToken")
 ///             .and_then(|value| value.to_str().ok())
-///             .ok_or(MissingToken)?;
+///             .ok_or_else(|| Error::from_string("missing token", StatusCode::BAD_REQUEST))?;
 ///         Ok(Token(token.to_string()))
 ///     }
 /// }
@@ -270,17 +269,23 @@ impl RequestBody {
 ///     .await;
 /// # });
 /// ```
-
 #[async_trait::async_trait]
 pub trait FromRequest<'a>: Sized {
-    /// The error type of this extractor.
-    ///
-    /// If you don't know what type you should use, you can use
-    /// [`Error`](crate::Error).
-    type Error: IntoResponse;
+    /// Extract from request head and body.
+    async fn from_request(req: &'a Request, body: &mut RequestBody) -> Result<Self>;
 
-    /// Perform the extraction.
-    async fn from_request(req: &'a Request, body: &mut RequestBody) -> Result<Self, Self::Error>;
+    /// Extract from request head.
+    ///
+    /// If you know that this type does not need to extract the body, then you
+    /// can just use it.
+    ///
+    /// For example [`Query`], [`Path`] they only extract the content from the
+    /// request head, using this method would be more convenient.
+    /// `String`,`Vec<u8>` they extract the body of the request, using this
+    /// method will cause `ReadBodyError` error.
+    async fn from_request_without_body(req: &'a Request) -> Result<Self> {
+        Self::from_request(req, &mut Default::default()).await
+    }
 }
 
 /// Represents a type that can convert into response.
@@ -361,7 +366,7 @@ pub trait FromRequest<'a>: Sized {
 /// with an event stream body. Use the [`SSE::new`](sse::SSE::new) function to
 /// create it.
 ///
-/// # Custom response
+/// # Create you own response
 ///
 /// ```
 /// use poem::{handler, http::Uri, web::Query, Endpoint, IntoResponse, Request, Response};
@@ -398,6 +403,7 @@ pub trait FromRequest<'a>: Sized {
 ///                 .finish()
 ///         )
 ///         .await
+///         .unwrap()
 ///         .take_body()
 ///         .into_string()
 ///         .await
@@ -409,6 +415,7 @@ pub trait FromRequest<'a>: Sized {
 ///     index
 ///         .call(Request::builder().uri(Uri::from_static("/")).finish())
 ///         .await
+///         .unwrap()
 ///         .take_body()
 ///         .into_string()
 ///         .await
@@ -417,7 +424,6 @@ pub trait FromRequest<'a>: Sized {
 /// );
 /// # });
 /// ```
-
 pub trait IntoResponse: Send {
     /// Consume itself and return [`Response`].
     fn into_response(self) -> Response;
@@ -501,6 +507,12 @@ pub trait IntoResponse: Send {
     }
 }
 
+impl IntoResponse for Infallible {
+    fn into_response(self) -> Response {
+        unreachable!()
+    }
+}
+
 /// Returned by [`with_header`](IntoResponse::with_header) method.
 pub struct WithHeader<T> {
     inner: T,
@@ -553,13 +565,17 @@ impl IntoResponse for Response {
 
 impl IntoResponse for String {
     fn into_response(self) -> Response {
-        Response::builder().content_type("text/plain").body(self)
+        Response::builder()
+            .content_type("text/plain; charset=utf8")
+            .body(self)
     }
 }
 
 impl IntoResponse for &'static str {
     fn into_response(self) -> Response {
-        Response::builder().content_type("text/plain").body(self)
+        Response::builder()
+            .content_type("text/plain; charset=utf8")
+            .body(self)
     }
 }
 
@@ -630,19 +646,6 @@ impl<T: IntoResponse> IntoResponse for (HeaderMap, T) {
     }
 }
 
-impl<T, E> IntoResponse for std::result::Result<T, E>
-where
-    T: IntoResponse,
-    E: IntoResponse,
-{
-    fn into_response(self) -> Response {
-        match self {
-            Ok(resp) => resp.into_response(),
-            Err(err) => err.into_response(),
-        }
-    }
-}
-
 /// An HTML response.
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct Html<T>(pub T);
@@ -650,116 +653,99 @@ pub struct Html<T>(pub T);
 impl<T: Into<String> + Send> IntoResponse for Html<T> {
     fn into_response(self) -> Response {
         Response::builder()
-            .content_type("text/html")
+            .content_type("text/html; charset=utf8")
             .body(self.0.into())
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for &'a Request {
-    type Error = Infallible;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
         Ok(req)
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for &'a Uri {
-    type Error = Infallible;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
         Ok(req.uri())
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for Method {
-    type Error = Infallible;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
         Ok(req.method().clone())
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for Version {
-    type Error = Infallible;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
         Ok(req.version())
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for &'a HeaderMap {
-    type Error = Infallible;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
         Ok(req.headers())
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for Body {
-    type Error = ReadBodyError;
-
-    async fn from_request(_req: &'a Request, body: &mut RequestBody) -> Result<Self, Self::Error> {
-        body.take()
+    async fn from_request(_req: &'a Request, body: &mut RequestBody) -> Result<Self> {
+        Ok(body.take()?)
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for String {
-    type Error = ReadBodyError;
-
-    async fn from_request(_req: &'a Request, body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(_req: &'a Request, body: &mut RequestBody) -> Result<Self> {
         let data = body.take()?.into_bytes().await?;
-        String::from_utf8(data.to_vec()).map_err(ReadBodyError::Utf8)
+        Ok(String::from_utf8(data.to_vec()).map_err(ReadBodyError::Utf8)?)
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for Bytes {
-    type Error = ReadBodyError;
-
-    async fn from_request(_req: &'a Request, body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(_req: &'a Request, body: &mut RequestBody) -> Result<Self> {
         Ok(body.take()?.into_bytes().await?)
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for Vec<u8> {
-    type Error = ReadBodyError;
-
-    async fn from_request(_req: &'a Request, body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(_req: &'a Request, body: &mut RequestBody) -> Result<Self> {
         Ok(body.take()?.into_vec().await?)
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for &'a RemoteAddr {
-    type Error = Infallible;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
         Ok(&req.state().remote_addr)
     }
 }
 
 #[async_trait::async_trait]
-impl<'a, T: FromRequest<'a>> FromRequest<'a> for Option<T> {
-    type Error = T::Error;
+impl<'a> FromRequest<'a> for &'a LocalAddr {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
+        Ok(&req.state().local_addr)
+    }
+}
 
-    async fn from_request(req: &'a Request, body: &mut RequestBody) -> Result<Self, Self::Error> {
+#[async_trait::async_trait]
+impl<'a, T: FromRequest<'a>> FromRequest<'a> for Option<T> {
+    async fn from_request(req: &'a Request, body: &mut RequestBody) -> Result<Self> {
         Ok(T::from_request(req, body).await.ok())
     }
 }
 
 #[async_trait::async_trait]
-impl<'a, T: FromRequest<'a>> FromRequest<'a> for Result<T, T::Error> {
-    type Error = Infallible;
-
-    async fn from_request(req: &'a Request, body: &mut RequestBody) -> Result<Self, Self::Error> {
+impl<'a, T: FromRequest<'a>> FromRequest<'a> for Result<T> {
+    async fn from_request(req: &'a Request, body: &mut RequestBody) -> Result<Self> {
         Ok(T::from_request(req, body).await)
     }
 }
@@ -767,7 +753,7 @@ impl<'a, T: FromRequest<'a>> FromRequest<'a> for Result<T, T::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Error;
+    use crate::Addr;
 
     #[tokio::test]
     async fn into_response() {
@@ -844,39 +830,6 @@ mod tests {
         );
         assert_eq!(resp.into_body().into_string().await.unwrap(), "abc");
 
-        // Result<T, E>
-        let resp = Ok::<_, Error>("abc").into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.into_body().into_string().await.unwrap(), "abc");
-
-        let resp =
-            Err::<(), _>(Error::new(StatusCode::BAD_GATEWAY).with_reason_string("bad gateway"))
-                .into_response();
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(resp.into_body().into_string().await.unwrap(), "bad gateway");
-
-        struct CustomError;
-
-        impl IntoResponse for CustomError {
-            fn into_response(self) -> Response {
-                Response::builder()
-                    .status(StatusCode::CONFLICT)
-                    .header("Value1", "123")
-                    .body("custom error")
-            }
-        }
-
-        let resp = Err::<(), _>(CustomError).into_response();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            resp.headers().get("Value1"),
-            Some(&HeaderValue::from_static("123"))
-        );
-        assert_eq!(
-            resp.into_body().into_string().await.unwrap(),
-            "custom error"
-        );
-
         // StatusCode
         let resp = StatusCode::CREATED.into_response();
         assert_eq!(resp.status(), StatusCode::CREATED);
@@ -885,13 +838,13 @@ mod tests {
         // Html
         let resp = Html("abc").into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.content_type(), Some("text/html"));
+        assert_eq!(resp.content_type(), Some("text/html; charset=utf8"));
         assert_eq!(resp.into_body().into_string().await.unwrap(), "abc");
 
         // Json
         let resp = Json(serde_json::json!({ "a": 1, "b": 2})).into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.content_type(), Some("application/json"));
+        assert_eq!(resp.content_type(), Some("application/json; charset=utf8"));
         assert_eq!(
             resp.into_body().into_string().await.unwrap(),
             r#"{"a":1,"b":2}"#
@@ -941,7 +894,8 @@ mod tests {
                 .header("Value2", "456")
                 .uri(Uri::from_static("http://example.com/a/b"))
                 .body("abc");
-            req.state_mut().remote_addr = RemoteAddr::custom("test", "example");
+            req.state_mut().remote_addr = RemoteAddr(Addr::custom("test", "example"));
+            req.state_mut().local_addr = LocalAddr(Addr::custom("test", "example-local"));
             req
         }
 
@@ -974,7 +928,13 @@ mod tests {
         // &RemoteAddr
         assert_eq!(
             <&RemoteAddr>::from_request(&req, &mut body).await.unwrap(),
-            &RemoteAddr::custom("test", "example")
+            &RemoteAddr(Addr::custom("test", "example"))
+        );
+
+        // &LocalAddr
+        assert_eq!(
+            <&LocalAddr>::from_request(&req, &mut body).await.unwrap(),
+            &LocalAddr(Addr::custom("test", "example-local"))
         );
 
         // &Method

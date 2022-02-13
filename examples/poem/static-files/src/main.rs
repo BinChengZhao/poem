@@ -1,4 +1,4 @@
-use poem::{endpoint::Files, listener::TcpListener, Route, Server};
+use poem::{endpoint::StaticFilesEndpoint, listener::TcpListener, Route, Server};
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
@@ -9,8 +9,9 @@ async fn main() -> Result<(), std::io::Error> {
 
     let app = Route::new().nest(
         "/",
-        Files::new("./examples/poem/static-files/files").show_files_listing(),
+        StaticFilesEndpoint::new("./poem/static-files/files").show_files_listing(),
     );
-    let server = Server::new(TcpListener::bind("127.0.0.1:3000")).await?;
-    server.run(app).await
+    Server::new(TcpListener::bind("127.0.0.1:3000"))
+        .run(app)
+        .await
 }

@@ -8,7 +8,7 @@ use poem_openapi::{
         multipart::{JsonField, Upload},
         Binary,
     },
-    Enum, Multipart, Object, ParseRequestError,
+    Enum, Multipart, Object,
 };
 
 fn create_multipart_payload(parts: &[(&str, Option<&str>, &[u8])]) -> Vec<u8> {
@@ -51,7 +51,7 @@ async fn rename_all() {
     #[oai(rename_all = "UPPERCASE")]
     struct A {
         name: String,
-        file: Binary,
+        file: Binary<Vec<u8>>,
     }
 
     let data = create_multipart_payload(&[("NAME", None, b"abc"), ("FILE", None, &[1, 2, 3])]);
@@ -77,13 +77,15 @@ async fn required_fields() {
     #[derive(Multipart, Debug, Eq, PartialEq)]
     struct A {
         name: String,
-        file: Binary,
+        file: Binary<Vec<u8>>,
+        #[oai(default)]
+        c: i32,
     }
 
     let schema_ref = A::schema_ref();
     let schema: &MetaSchema = schema_ref.unwrap_inline();
     assert_eq!(schema.ty, "object");
-    assert_eq!(schema.properties.len(), 2);
+    assert_eq!(schema.properties.len(), 3);
 
     assert_eq!(schema.properties[0].0, "name");
     assert_eq!(schema.properties[0].1.unwrap_inline().ty, "string");
@@ -102,11 +104,10 @@ async fn required_fields() {
     )
     .await
     .unwrap_err();
+
     assert_eq!(
-        err,
-        ParseRequestError::ParseRequestBody {
-            reason: "field `file` is required".to_string()
-        }
+        err.to_string(),
+        "parse multipart error: field `file` is required"
     );
 }
 
@@ -115,7 +116,7 @@ async fn optional_fields() {
     #[derive(Multipart, Debug, Eq, PartialEq)]
     struct A {
         name: Option<String>,
-        file: Binary,
+        file: Binary<Vec<u8>>,
     }
 
     let schema_ref = A::schema_ref();
@@ -159,7 +160,7 @@ async fn rename_field() {
     struct A {
         #[oai(rename = "Name")]
         name: String,
-        file: Binary,
+        file: Binary<Vec<u8>>,
     }
 
     let data = create_multipart_payload(&[("Name", None, b"abc"), ("file", None, &[1, 2, 3])]);
@@ -185,7 +186,7 @@ async fn skip() {
     #[derive(Multipart, Debug, Eq, PartialEq)]
     struct A {
         name: String,
-        file: Binary,
+        file: Binary<Vec<u8>>,
         #[oai(skip)]
         value1: i32,
         #[oai(skip)]
@@ -241,9 +242,9 @@ async fn upload() {
 async fn validator() {
     #[derive(Multipart, Debug, Eq, PartialEq)]
     struct A {
-        #[oai(max_length = "10")]
+        #[oai(validator(max_length = "10"))]
         name: String,
-        #[oai(maximum(value = "32"))]
+        #[oai(validator(maximum(value = "32")))]
         value: JsonField<i32>,
     }
 
@@ -268,12 +269,10 @@ async fn validator() {
     )
     .await
     .unwrap_err();
+
     assert_eq!(
-        err,
-        ParseRequestError::ParseRequestBody {
-            reason: r#"field `value` verification failed. maximum(32, exclusive: false)"#
-                .to_string()
-        }
+        err.to_string(),
+        "parse multipart error: field `value` verification failed. maximum(32, exclusive: false)"
     );
 }
 
@@ -297,14 +296,14 @@ async fn default() {
 
     let schema_ref = A::schema_ref();
     let schema: &MetaSchema = schema_ref.unwrap_inline();
-    assert_eq!(schema.properties[0].0, "valueString");
+    assert_eq!(schema.properties[0].0, "value_string");
     assert_eq!(schema.properties[0].1.unwrap_inline().ty, "string");
     assert_eq!(
         schema.properties[0].1.unwrap_inline().default,
         Some("asd".into())
     );
 
-    assert_eq!(schema.properties[1].0, "valueArray");
+    assert_eq!(schema.properties[1].0, "value_array");
     assert_eq!(schema.properties[1].1.unwrap_inline().ty, "array");
     assert_eq!(
         schema.properties[1]
@@ -321,8 +320,8 @@ async fn default() {
     );
 
     let data = create_multipart_payload(&[
-        ("valueString", None, b"abc"),
-        ("valueArray", None, b"[10, 20, 30]"),
+        ("value_string", None, b"abc"),
+        ("value_array", None, b"[10, 20, 30]"),
     ]);
     let a = A::from_request(
         &Request::builder()
@@ -421,12 +420,9 @@ async fn repeated_error() {
     .await
     .unwrap_err();
     assert_eq!(
-        err,
-        ParseRequestError::ParseRequestBody {
-            reason: "failed to parse field `value`: failed to parse \"string\": repeated field"
-                .to_string()
-        }
-    )
+        err.to_string(),
+        "parse multipart error: failed to parse field `value`: failed to parse \"string\": repeated field"
+    );
 }
 
 #[test]
@@ -476,7 +472,7 @@ fn inline_field() {
     assert_eq!(
         meta_inner_obj.all_of[1],
         MetaSchemaRef::Inline(Box::new(MetaSchema {
-            title: Some("Inner Obj"),
+            description: Some("Inner Obj"),
             default: Some(serde_json::json!({
                 "v": 100,
             })),
@@ -492,9 +488,34 @@ fn inline_field() {
     assert_eq!(
         meta_inner_enum.all_of[1],
         MetaSchemaRef::Inline(Box::new(MetaSchema {
-            title: Some("Inner Enum"),
+            description: Some("Inner Enum"),
             default: Some(serde_json::json!("B")),
             ..MetaSchema::ANY
         }))
     );
+}
+
+#[tokio::test]
+async fn deny_unknown_fields() {
+    #[derive(Multipart, Debug, Eq, PartialEq)]
+    #[oai(deny_unknown_fields)]
+    struct A {
+        a: String,
+        b: String,
+    }
+
+    let data = create_multipart_payload(&[
+        ("a", None, b"abc"),
+        ("b", None, b"def"),
+        ("c", None, b"ghi"),
+    ]);
+    let err = A::from_request(
+        &Request::builder()
+            .header("content-type", "multipart/form-data; boundary=X-BOUNDARY")
+            .finish(),
+        &mut RequestBody::new(data.into()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.to_string(), "parse multipart error: unknown field `c`");
 }

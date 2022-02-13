@@ -1,13 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
-use serde::{
-    ser::{SerializeMap, SerializeStruct},
-    Serialize, Serializer,
-};
+use serde::{ser::SerializeMap, Serialize, Serializer};
 
 use crate::registry::{
-    MetaApi, MetaInfo, MetaPath, MetaResponses, MetaSchema, MetaSchemaRef, MetaSecurityScheme,
-    MetaServer, Registry,
+    MetaApi, MetaExternalDocument, MetaInfo, MetaPath, MetaResponses, MetaSchema, MetaSchemaRef,
+    MetaSecurityScheme, MetaServer, MetaWebhook, Registry,
 };
 
 const OPENAPI_VERSION: &str = "3.0.0";
@@ -17,8 +14,8 @@ impl<'a> Serialize for MetaSchemaRef {
         match self {
             MetaSchemaRef::Inline(schema) => schema.serialize(serializer),
             MetaSchemaRef::Reference(name) => {
-                let mut s = serializer.serialize_struct("MetaSchemaRef", 1)?;
-                s.serialize_field("$ref", &format!("#/components/schemas/{}", name))?;
+                let mut s = serializer.serialize_map(None)?;
+                s.serialize_entry("$ref", &format!("#/components/schemas/{}", name))?;
                 s.end()
             }
         }
@@ -64,36 +61,55 @@ impl Serialize for MetaResponses {
     }
 }
 
+struct WebhookMap<'a>(&'a [MetaWebhook]);
+
+impl<'a> Serialize for WebhookMap<'a> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut s = serializer.serialize_map(Some(self.0.len()))?;
+        for webhook in self.0 {
+            s.serialize_entry(&webhook.name, &webhook.operation)?;
+        }
+        s.end()
+    }
+}
+
 pub(crate) struct Document<'a> {
-    pub(crate) info: Option<&'a MetaInfo>,
+    pub(crate) info: &'a MetaInfo,
     pub(crate) servers: &'a [MetaServer],
     pub(crate) apis: &'a [MetaApi],
-    pub(crate) registry: &'a Registry,
+    pub(crate) webhooks: &'a [MetaWebhook],
+    pub(crate) registry: &'a mut Registry,
+    pub(crate) external_document: Option<&'a MetaExternalDocument>,
 }
 
 impl<'a> Serialize for Document<'a> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Components<'a> {
-            schemas: &'a HashMap<&'static str, MetaSchema>,
+            schemas: &'a BTreeMap<&'static str, MetaSchema>,
             #[serde(rename = "securitySchemes")]
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             security_schemes: &'a BTreeMap<&'static str, MetaSecurityScheme>,
         }
 
-        let mut s = serializer.serialize_struct("OpenAPI", 6)?;
+        let mut s = serializer.serialize_map(None)?;
 
-        s.serialize_field("openapi", OPENAPI_VERSION)?;
-        s.serialize_field("info", &self.info)?;
-        s.serialize_field("servers", self.servers)?;
-        s.serialize_field("tags", &self.registry.tags)?;
-        s.serialize_field("paths", &PathMap(self.apis))?;
-        s.serialize_field(
+        s.serialize_entry("openapi", OPENAPI_VERSION)?;
+        s.serialize_entry("info", &self.info)?;
+        s.serialize_entry("servers", self.servers)?;
+        s.serialize_entry("tags", &self.registry.tags)?;
+        if !self.webhooks.is_empty() {
+            s.serialize_entry("webhooks", &WebhookMap(self.webhooks))?;
+        }
+        s.serialize_entry("paths", &PathMap(self.apis))?;
+        s.serialize_entry(
             "components",
             &Components {
                 schemas: &self.registry.schemas,
                 security_schemes: &self.registry.security_schemes,
             },
         )?;
+        s.serialize_entry("externalDocs", &self.external_document)?;
 
         s.end()
     }

@@ -21,9 +21,12 @@
     <img src="https://img.shields.io/badge/unsafe-forbidden-success.svg?style=flat-square"
       alt="Unsafe Rust forbidden" />
   </a>
-  <a href="https://blog.rust-lang.org/2021/07/29/Rust-1.54.0.html">
-    <img src="https://img.shields.io/badge/rustc-1.54+-ab6000.svg"
-      alt="rustc 1.54+" />
+  <a href="https://blog.rust-lang.org/2021/11/01/Rust-1.56.1.html">
+    <img src="https://img.shields.io/badge/rustc-1.56.1+-ab6000.svg"
+      alt="rustc 1.56.1+" />
+  </a>
+  <a href="https://discord.gg/qWWNxwasb7">
+    <img src="https://img.shields.io/discord/932986985604333638.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2" />
   </a>
 </div>
 
@@ -33,7 +36,6 @@
 It uses procedural macros to generate a lots of boilerplate code, so that you only need to focus on the more 
 important business implementations.
 
-* [Book](https://poem-web.github.io/poem/)
 * [Docs](https://docs.rs/poem-openapi)
 * [Cargo package](https://crates.io/crates/poem-openapi)
 
@@ -48,10 +50,18 @@ important business implementations.
 
 To avoid compiling unused dependencies, Poem gates certain features, some of which are disabled by default:
 
-| Feature    | Description                                                  | Default enabled    |
-| ---------- | ------------------------------------------------------------ | ------------------ |
-| chrono     | Integrate with the [`chrono` crate](https://crates.io/crates/chrono). | :x:       |
-| swagger-ui | Add swagger UI support                                       | :heavy_check_mark: |
+| Feature    | Description                                                           |
+|------------|-----------------------------------------------------------------------|
+| chrono     | Integrate with the [`chrono` crate](https://crates.io/crates/chrono). |
+| swagger-ui | Add swagger UI support                                                |
+| rapidoc    | Add RapiDoc UI support                                                |
+| redoc      | Add Redoc UI support                                                  |
+| email      | Support for email address string                                      |
+| hostname   | Support for hostname string                                           |
+| uuid       | Integrate with the [`uuid` crate](https://crates.io/crates/uuid)      |
+| url        | Integrate with the [`url` crate](https://crates.io/crates/url)        |
+| bson       | Integrate with the [`bson` crate](https://crates.io/crates/bson)      |
+| static-files | Support for static file response                                    |
 
 ## Safety
 
@@ -61,18 +71,15 @@ This crate uses `#![forbid(unsafe_code)]` to ensure everything is implemented in
 
 ```rust
 use poem::{listener::TcpListener, Route};
-use poem_openapi::{payload::PlainText, OpenApi, OpenApiService};
+use poem_openapi::{param::Query, payload::PlainText, OpenApi, OpenApiService};
 
 struct Api;
 
 #[OpenApi]
 impl Api {
     #[oai(path = "/hello", method = "get")]
-    async fn index(
-        &self,
-        #[oai(name = "name", in = "query")] name: Option<String>,
-    ) -> PlainText<String> {
-        match name {
+    async fn index(&self, name: Query<Option<String>>) -> PlainText<String> {
+        match name.0 {
             Some(name) => PlainText(format!("hello, {}!", name)),
             None => PlainText("hello!".to_string()),
         }
@@ -81,15 +88,13 @@ impl Api {
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
-    let listener = TcpListener::bind("127.0.0.1:3000");
-    let api_service = OpenApiService::new(Api)
-        .title("Hello World")
-        .server("http://localhost:3000/api");
-    let ui = api_service.swagger_ui("http://localhost:3000");
+    let api_service =
+        OpenApiService::new(Api, "Hello World", "1.0").server("http://localhost:3000/api");
+    let ui = api_service.swagger_ui();
+    let app = Route::new().nest("/api", api_service).nest("/", ui);
 
-    poem::Server::new(listener)
-        .await?
-        .run(Route::new().nest("/api", api_service).nest("/", ui))
+    poem::Server::new(TcpListener::bind("127.0.0.1:3000"))
+        .run(app)
         .await
 }
 ```
@@ -110,7 +115,7 @@ hello, sunli!
 
 ## MSRV
 
-The minimum supported Rust version for this crate is `1.54.0`.
+The minimum supported Rust version for this crate is `1.56.1`.
 
 ## Contributing
 

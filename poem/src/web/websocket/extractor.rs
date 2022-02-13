@@ -1,6 +1,6 @@
 use std::{borrow::Cow, future::Future};
 
-use hyper::upgrade::OnUpgrade;
+use headers::HeaderMapExt;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
 use super::{utils::sign, WebSocketStream};
@@ -10,10 +10,14 @@ use crate::{
         header::{self, HeaderValue},
         Method, StatusCode,
     },
-    Body, FromRequest, IntoResponse, Request, RequestBody, Response, Result,
+    Body, FromRequest, IntoResponse, OnUpgrade, Request, RequestBody, Response, Result,
 };
 
 /// An extractor that can accept websocket connections.
+///
+/// # Errors
+///
+/// - [`WebSocketError`]
 pub struct WebSocket {
     key: HeaderValue,
     on_upgrade: OnUpgrade,
@@ -21,17 +25,22 @@ pub struct WebSocket {
     sec_websocket_protocol: Option<HeaderValue>,
 }
 
-#[async_trait::async_trait]
-impl<'a> FromRequest<'a> for WebSocket {
-    type Error = WebSocketError;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+impl WebSocket {
+    async fn internal_from_request(req: &Request) -> Result<Self, WebSocketError> {
         if req.method() != Method::GET
-            || req.headers().get(header::CONNECTION) != Some(&HeaderValue::from_static("Upgrade"))
             || req.headers().get(header::UPGRADE) != Some(&HeaderValue::from_static("websocket"))
             || req.headers().get(header::SEC_WEBSOCKET_VERSION)
                 != Some(&HeaderValue::from_static("13"))
         {
+            return Err(WebSocketError::InvalidProtocol);
+        }
+
+        if !matches!(
+            req.headers()
+                .typed_get::<headers::Connection>()
+                .map(|connection| connection.contains(header::UPGRADE)),
+            Some(true)
+        ) {
             return Err(WebSocketError::InvalidProtocol);
         }
 
@@ -43,17 +52,19 @@ impl<'a> FromRequest<'a> for WebSocket {
 
         let sec_websocket_protocol = req.headers().get(header::SEC_WEBSOCKET_PROTOCOL).cloned();
 
-        let on_upgrade = match req.state().on_upgrade.lock().take() {
-            Some(on_upgrade) => on_upgrade,
-            None => return Err(WebSocketError::NoUpgrade),
-        };
-
         Ok(Self {
             key,
-            on_upgrade,
+            on_upgrade: req.take_upgrade()?,
             protocols: None,
             sec_websocket_protocol,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl<'a> FromRequest<'a> for WebSocket {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
+        Self::internal_from_request(req).await.map_err(Into::into)
     }
 }
 

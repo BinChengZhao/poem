@@ -1,21 +1,23 @@
 //! Commonly used payload types.
 
+mod attachment;
 mod binary;
+mod event_stream;
+mod html;
 mod json;
 mod plain_text;
+mod response;
 
-pub use binary::Binary;
-pub use json::Json;
-pub use plain_text::PlainText;
 use poem::{Request, RequestBody, Result};
 
-use crate::{
-    registry::{MetaSchemaRef, Registry},
-    ParseRequestError,
+pub use self::{
+    attachment::Attachment, binary::Binary, event_stream::EventStream, html::Html, json::Json,
+    plain_text::PlainText, response::Response,
 };
+use crate::registry::{MetaSchemaRef, Registry};
 
 /// Represents a payload type.
-pub trait Payload {
+pub trait Payload: Send {
     /// The content type of this payload.
     const CONTENT_TYPE: &'static str;
 
@@ -30,30 +32,9 @@ pub trait Payload {
 /// Represents a payload that can parse from HTTP request.
 #[poem::async_trait]
 pub trait ParsePayload: Sized {
+    /// If it is `true`, it means that this payload is required.
+    const IS_REQUIRED: bool;
+
     /// Parse the payload object from the HTTP request.
-    async fn from_request(
-        request: &Request,
-        body: &mut RequestBody,
-    ) -> Result<Self, ParseRequestError>;
-}
-
-impl<T: Payload> Payload for Result<T> {
-    const CONTENT_TYPE: &'static str = T::CONTENT_TYPE;
-
-    fn schema_ref() -> MetaSchemaRef {
-        T::schema_ref()
-    }
-}
-
-#[poem::async_trait]
-impl<T: ParsePayload> ParsePayload for Result<T> {
-    async fn from_request(
-        request: &Request,
-        body: &mut RequestBody,
-    ) -> Result<Self, ParseRequestError> {
-        match T::from_request(request, body).await {
-            Ok(payload) => Ok(Ok(payload)),
-            Err(err) => Ok(Err(err.into())),
-        }
-    }
+    async fn from_request(request: &Request, body: &mut RequestBody) -> Result<Self>;
 }

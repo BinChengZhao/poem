@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use poem::{listener::TcpListener, Error, Result, Route};
+use poem::{error::BadRequest, listener::TcpListener, Result, Route, Server};
 use poem_openapi::{
+    param::Path,
     payload::{Binary, Json},
     types::multipart::Upload,
     ApiResponse, Multipart, Object, OpenApi, OpenApiService,
@@ -59,7 +60,7 @@ impl Api {
             desc: upload.desc,
             content_type: upload.file.content_type().map(ToString::to_string),
             filename: upload.file.file_name().map(ToString::to_string),
-            data: upload.file.into_vec().await.map_err(Error::bad_request)?,
+            data: upload.file.into_vec().await.map_err(BadRequest)?,
         };
         status.files.insert(id, file);
         Ok(Json(id))
@@ -67,7 +68,7 @@ impl Api {
 
     /// Get file
     #[oai(path = "/files/:id", method = "get")]
-    async fn get(&self, #[oai(name = "id", in = "path")] id: u64) -> GetFileResponse {
+    async fn get(&self, id: Path<u64>) -> GetFileResponse {
         let status = self.status.lock().await;
         match status.files.get(&id) {
             Some(file) => {
@@ -89,19 +90,20 @@ async fn main() -> Result<(), std::io::Error> {
     }
     tracing_subscriber::fmt::init();
 
-    let listener = TcpListener::bind("127.0.0.1:3000");
-    let api_service = OpenApiService::new(Api {
-        status: Mutex::new(Status {
-            id: 1,
-            files: Default::default(),
-        }),
-    })
-    .title("Upload Files")
+    let api_service = OpenApiService::new(
+        Api {
+            status: Mutex::new(Status {
+                id: 1,
+                files: Default::default(),
+            }),
+        },
+        "Upload Files",
+        "1.0",
+    )
     .server("http://localhost:3000/api");
     let ui = api_service.swagger_ui();
 
-    poem::Server::new(listener)
-        .await?
+    Server::new(TcpListener::bind("127.0.0.1:3000"))
         .run(Route::new().nest("/api", api_service).nest("/", ui))
         .await
 }

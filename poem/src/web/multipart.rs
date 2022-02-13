@@ -1,5 +1,5 @@
 use std::{
-    io::{Error as IoError, ErrorKind},
+    fmt::{self, Debug, Formatter},
     str::FromStr,
 };
 
@@ -17,6 +17,26 @@ use crate::{error::ParseMultipartError, http::header, FromRequest, Request, Requ
 #[cfg_attr(docsrs, doc(cfg(feature = "multipart")))]
 pub struct Field(multer::Field<'static>);
 
+impl Debug for Field {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("Field");
+
+        if let Some(name) = self.name() {
+            d.field("name", &name);
+        }
+
+        if let Some(file_name) = self.file_name() {
+            d.field("file_name", &file_name);
+        }
+
+        if let Some(content_type) = self.content_type() {
+            d.field("content_type", &content_type);
+        }
+
+        d.finish()
+    }
+}
+
 impl Field {
     /// Get the content type of the field.
     #[inline]
@@ -30,14 +50,14 @@ impl Field {
         self.0.file_name()
     }
 
-    /// The field name found in the `Content-Disposition` header.
+    /// The name found in the `Content-Disposition` header.
     #[inline]
     pub fn name(&self) -> Option<&str> {
         self.0.name()
     }
 
     /// Get the full data of the field as bytes.
-    pub async fn bytes(self) -> Result<Vec<u8>, IoError> {
+    pub async fn bytes(self) -> Result<Vec<u8>, ParseMultipartError> {
         let mut data = Vec::new();
         let mut buf = [0; 2048];
         let mut reader = self.into_async_read();
@@ -55,14 +75,14 @@ impl Field {
 
     /// Get the full field data as text.
     #[inline]
-    pub async fn text(self) -> Result<String, IoError> {
-        String::from_utf8(self.bytes().await?).map_err(|err| IoError::new(ErrorKind::Other, err))
+    pub async fn text(self) -> Result<String, ParseMultipartError> {
+        Ok(String::from_utf8(self.bytes().await?)?)
     }
 
     /// Write the full field data to a temporary file and return it.
     #[cfg(feature = "tempfile")]
     #[cfg_attr(docsrs, doc(cfg(feature = "tempfile")))]
-    pub async fn tempfile(self) -> Result<File, IoError> {
+    pub async fn tempfile(self) -> Result<File, ParseMultipartError> {
         let mut reader = self.into_async_read();
         let mut file = tokio::fs::File::from_std(::libtempfile::tempfile()?);
         tokio::io::copy(&mut reader, &mut file).await?;
@@ -74,7 +94,7 @@ impl Field {
     pub fn into_async_read(self) -> impl AsyncRead + Send {
         tokio_util::io::StreamReader::new(
             self.0
-                .map_err(|err| std::io::Error::new(ErrorKind::Other, err.to_string())),
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
         )
     }
 }
@@ -82,14 +102,23 @@ impl Field {
 /// An extractor that parses `multipart/form-data` requests commonly used with
 /// file uploads.
 ///
+/// # Errors
+///
+/// - [`ReadBodyError`](crate::error::ReadBodyError)
+/// - [`ParseMultipartError`]
+///
 /// # Example
 ///
 /// ```
-/// use poem::{error::Error, web::Multipart, Result};
+/// use poem::{
+///     error::{BadRequest, Error},
+///     web::Multipart,
+///     Result,
+/// };
 ///
 /// async fn upload(mut multipart: Multipart) -> Result<()> {
 ///     while let Some(field) = multipart.next_field().await? {
-///         let data = field.bytes().await.map_err(Error::bad_request)?;
+///         let data = field.bytes().await.map_err(BadRequest)?;
 ///         println!("{} bytes", data.len());
 ///     }
 ///     Ok(())
@@ -102,9 +131,7 @@ pub struct Multipart {
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for Multipart {
-    type Error = ParseMultipartError;
-
-    async fn from_request(req: &'a Request, body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, body: &mut RequestBody) -> Result<Self> {
         let content_type = req
             .headers()
             .get(header::CONTENT_TYPE)
@@ -115,10 +142,12 @@ impl<'a> FromRequest<'a> for Multipart {
         if content_type.essence_str() != mime::MULTIPART_FORM_DATA {
             return Err(ParseMultipartError::InvalidContentType(
                 content_type.essence_str().to_string(),
-            ));
+            )
+            .into());
         }
 
-        let boundary = multer::parse_boundary(content_type.as_ref())?;
+        let boundary = multer::parse_boundary(content_type.as_ref())
+            .map_err(ParseMultipartError::Multipart)?;
         Ok(Self {
             inner: multer::Multipart::new(
                 tokio_util::io::ReaderStream::new(body.take()?.into_async_read()),
@@ -150,18 +179,18 @@ mod tests {
             todo!()
         }
 
-        let mut resp = index
+        let err = index
             .call(
                 Request::builder()
                     .header("content-type", "multipart/json; boundary=X-BOUNDARY")
                     .body(()),
             )
-            .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            resp.take_body().into_string().await.unwrap(),
-            "invalid content type `multipart/json`, expect: `multipart/form-data`"
-        );
+            .await
+            .unwrap_err();
+        match err.downcast_ref::<ParseMultipartError>().unwrap() {
+            ParseMultipartError::InvalidContentType(ct) if ct == "multipart/json" => {}
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -189,7 +218,8 @@ mod tests {
                     .header("content-type", "multipart/form-data; boundary=X-BOUNDARY")
                     .body(data),
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }

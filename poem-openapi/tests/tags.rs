@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use poem_openapi::{
-    registry::{MetaTag, Registry},
+    registry::{MetaExternalDocument, MetaTag, Registry},
     Tags,
 };
 
@@ -19,28 +19,28 @@ async fn rename_all() {
 }
 
 #[tokio::test]
-async fn default_rename_all() {
+async fn default_name() {
     #[derive(Tags)]
     enum MyTags {
         UserOperations,
         PetOperations,
     }
 
-    assert_eq!(MyTags::UserOperations.name(), "user_operations");
-    assert_eq!(MyTags::PetOperations.name(), "pet_operations");
+    assert_eq!(MyTags::UserOperations.name(), "UserOperations");
+    assert_eq!(MyTags::PetOperations.name(), "PetOperations");
 }
 
 #[tokio::test]
 async fn rename_item() {
     #[derive(Tags)]
     enum MyTags {
-        #[oai(rename = "UserOperations")]
+        #[oai(rename = "userOperations")]
         UserOperations,
         PetOperations,
     }
 
-    assert_eq!(MyTags::UserOperations.name(), "UserOperations");
-    assert_eq!(MyTags::PetOperations.name(), "pet_operations");
+    assert_eq!(MyTags::UserOperations.name(), "userOperations");
+    assert_eq!(MyTags::PetOperations.name(), "PetOperations");
 }
 
 #[tokio::test]
@@ -60,15 +60,44 @@ async fn meta() {
         registry.tags,
         vec![
             MetaTag {
-                name: "user_operations",
+                name: "UserOperations",
                 description: Some("User operations"),
+                external_docs: None
             },
             MetaTag {
-                name: "pet_operations",
+                name: "PetOperations",
                 description: Some("Pet operations"),
+                external_docs: None
             }
         ]
         .into_iter()
-        .collect::<HashSet<_>>()
+        .collect::<BTreeSet<_>>()
+    );
+}
+
+#[tokio::test]
+async fn external_docs() {
+    #[derive(Tags)]
+    #[allow(dead_code)]
+    enum MyTags {
+        #[oai(
+            external_docs = "https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.1.0.md"
+        )]
+        UserOperations,
+    }
+
+    let mut registry = Registry::new();
+    MyTags::UserOperations.register(&mut registry);
+    assert_eq!(
+        registry.tags.into_iter().next().unwrap(),
+        MetaTag {
+            name: "UserOperations",
+            description: None,
+            external_docs: Some(MetaExternalDocument {
+                url: "https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.1.0.md"
+                    .to_string(),
+                description: None
+            })
+        }
     );
 }

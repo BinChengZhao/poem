@@ -34,15 +34,15 @@ struct BasicAuthEndpoint<E> {
 
 #[poem::async_trait]
 impl<E: Endpoint> Endpoint for BasicAuthEndpoint<E> {
-    type Output = Result<E::Output>;
+    type Output = E::Output;
 
-    async fn call(&self, req: Request) -> Self::Output {
+    async fn call(&self, req: Request) -> Result<Self::Output> {
         if let Some(auth) = req.headers().typed_get::<headers::Authorization<Basic>>() {
             if auth.0.username() == self.username && auth.0.password() == self.password {
-                return Ok(self.ep.call(req).await);
+                return self.ep.call(req).await;
             }
         }
-        Err(Error::new(StatusCode::UNAUTHORIZED))
+        Err(Error::from_status(StatusCode::UNAUTHORIZED))
     }
 }
 
@@ -62,7 +62,7 @@ async fn main() -> Result<(), std::io::Error> {
         username: "test".to_string(),
         password: "123456".to_string(),
     });
-    let listener = TcpListener::bind("127.0.0.1:3000");
-    let server = Server::new(listener).await?;
-    server.run(app).await
+    Server::new(TcpListener::bind("127.0.0.1:3000"))
+        .run(app)
+        .await
 }

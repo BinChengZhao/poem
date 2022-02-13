@@ -4,7 +4,7 @@ use darling::{util::SpannedValue, FromMeta};
 use proc_macro2::{Ident, Span, TokenStream};
 use proc_macro_crate::{crate_name, FoundCrate};
 use quote::quote;
-use syn::{Attribute, Error, Lit, Meta, Result};
+use syn::{visit_mut, visit_mut::VisitMut, Attribute, Error, Lifetime, Lit, Meta, Result};
 
 use crate::error::GeneratorResult;
 
@@ -24,8 +24,8 @@ pub(crate) fn get_crate_name(internal: bool) -> TokenStream {
 pub(crate) fn get_description(attrs: &[Attribute]) -> Result<Option<String>> {
     let mut full_docs = String::new();
     for attr in attrs {
-        match attr.parse_meta()? {
-            Meta::NameValue(nv) if nv.path.is_ident("doc") => {
+        if attr.path.is_ident("doc") {
+            if let Meta::NameValue(nv) = attr.parse_meta()? {
                 if let Lit::Str(doc) = nv.lit {
                     let doc = doc.value();
                     let doc_str = doc.trim();
@@ -35,7 +35,6 @@ pub(crate) fn get_description(attrs: &[Attribute]) -> Result<Option<String>> {
                     full_docs += doc_str;
                 }
             }
-            _ => {}
         }
     }
     Ok(if full_docs.is_empty() {
@@ -43,6 +42,10 @@ pub(crate) fn get_description(attrs: &[Attribute]) -> Result<Option<String>> {
     } else {
         Some(full_docs)
     })
+}
+
+pub(crate) fn remove_description(attrs: &mut Vec<Attribute>) {
+    attrs.retain(|attr| !attr.path.is_ident("doc"));
 }
 
 pub(crate) fn get_summary_and_description(
@@ -94,20 +97,19 @@ pub(crate) fn parse_oai_attrs<T: FromMeta>(attrs: &[Attribute]) -> GeneratorResu
 pub(crate) fn convert_oai_path<'a, 'b: 'a>(
     path: &'a SpannedValue<String>,
     prefix_path: &'b Option<SpannedValue<String>>,
-) -> Result<(String, String, HashSet<&'a str>)> {
+) -> Result<(String, String)> {
     if !path.starts_with('/') {
         return Err(Error::new(path.span(), "The path must start with '/'."));
     }
 
-    let mut vars = HashSet::new();
     let mut oai_path = String::new();
     let mut new_path = String::new();
 
     if let Some(prefix_path) = prefix_path {
-        handle_path(prefix_path, &mut vars, &mut oai_path, &mut new_path)?;
+        handle_path(prefix_path, &mut oai_path, &mut new_path)?;
     }
 
-    handle_path(path, &mut vars, &mut oai_path, &mut new_path)?;
+    handle_path(path, &mut oai_path, &mut new_path)?;
 
     if oai_path.is_empty() {
         oai_path += "/";
@@ -117,15 +119,16 @@ pub(crate) fn convert_oai_path<'a, 'b: 'a>(
         new_path += "/";
     }
 
-    Ok((oai_path, new_path, vars))
+    Ok((oai_path, new_path))
 }
 
 fn handle_path<'a>(
     path: &'a SpannedValue<String>,
-    vars: &mut HashSet<&'a str>,
     oai_path: &mut String,
     new_path: &mut String,
 ) -> Result<()> {
+    let mut vars = HashSet::new();
+
     for s in path.split('/') {
         if s.is_empty() {
             continue;
@@ -154,4 +157,13 @@ fn handle_path<'a>(
         }
     }
     Ok(())
+}
+
+pub(crate) struct RemoveLifetime;
+
+impl VisitMut for RemoveLifetime {
+    fn visit_lifetime_mut(&mut self, i: &mut Lifetime) {
+        i.ident = Ident::new("_", Span::call_site());
+        visit_mut::visit_lifetime_mut(self, i);
+    }
 }

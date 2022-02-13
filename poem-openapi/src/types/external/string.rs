@@ -1,29 +1,45 @@
-use poem::web::Field;
+use std::borrow::Cow;
+
+use poem::{http::HeaderValue, web::Field};
 use serde_json::Value;
 
 use crate::{
-    registry::MetaSchemaRef,
+    registry::{MetaSchema, MetaSchemaRef},
     types::{
         ParseError, ParseFromJSON, ParseFromMultipartField, ParseFromParameter, ParseResult,
-        ToJSON, Type, TypeName,
+        ToHeader, ToJSON, Type,
     },
 };
 
 impl Type for String {
-    const NAME: TypeName = TypeName::Normal {
-        ty: "string",
-        format: None,
-    };
+    const IS_REQUIRED: bool = true;
 
-    fn schema_ref() -> MetaSchemaRef {
-        MetaSchemaRef::Inline(Box::new(Self::NAME.into()))
+    type RawValueType = Self;
+
+    type RawElementValueType = Self;
+
+    fn name() -> Cow<'static, str> {
+        "string".into()
     }
 
-    impl_value_type!();
+    fn schema_ref() -> MetaSchemaRef {
+        MetaSchemaRef::Inline(Box::new(MetaSchema::new("string")))
+    }
+
+    fn as_raw_value(&self) -> Option<&Self::RawValueType> {
+        Some(self)
+    }
+
+    fn raw_element_iter<'a>(
+        &'a self,
+    ) -> Box<dyn Iterator<Item = &'a Self::RawElementValueType> + 'a> {
+        Box::new(self.as_raw_value().into_iter())
+    }
 }
 
 impl ParseFromJSON for String {
-    fn parse_from_json(value: Value) -> ParseResult<Self> {
+    fn parse_from_json(value: Option<Value>) -> ParseResult<Self> {
+        let value = value.unwrap_or_default();
         if let Value::String(value) = value {
             Ok(value)
         } else {
@@ -33,11 +49,8 @@ impl ParseFromJSON for String {
 }
 
 impl ParseFromParameter for String {
-    fn parse_from_parameter(value: Option<&str>) -> ParseResult<Self> {
-        match value {
-            Some(value) => Ok(value.to_string()),
-            None => Err(ParseError::expected_input()),
-        }
+    fn parse_from_parameter(value: &str) -> ParseResult<Self> {
+        Ok(value.to_string())
     }
 }
 
@@ -52,26 +65,48 @@ impl ParseFromMultipartField for String {
 }
 
 impl ToJSON for String {
-    fn to_json(&self) -> Value {
-        Value::String(self.clone())
+    fn to_json(&self) -> Option<Value> {
+        Some(Value::String(self.clone()))
+    }
+}
+
+impl ToHeader for String {
+    fn to_header(&self) -> Option<HeaderValue> {
+        match HeaderValue::from_str(self) {
+            Ok(value) => Some(value),
+            Err(_) => None,
+        }
     }
 }
 
 impl<'a> Type for &'a str {
-    const NAME: TypeName = TypeName::Normal {
-        ty: "string",
-        format: None,
-    };
+    const IS_REQUIRED: bool = true;
 
-    fn schema_ref() -> MetaSchemaRef {
-        MetaSchemaRef::Inline(Box::new(Self::NAME.into()))
+    type RawValueType = Self;
+
+    type RawElementValueType = Self;
+
+    fn name() -> Cow<'static, str> {
+        "string".into()
     }
 
-    impl_value_type!();
+    fn schema_ref() -> MetaSchemaRef {
+        MetaSchemaRef::Inline(Box::new(MetaSchema::new("string")))
+    }
+
+    fn as_raw_value(&self) -> Option<&Self::RawValueType> {
+        Some(self)
+    }
+
+    fn raw_element_iter<'b>(
+        &'b self,
+    ) -> Box<dyn Iterator<Item = &'b Self::RawElementValueType> + 'b> {
+        Box::new(self.as_raw_value().into_iter())
+    }
 }
 
 impl<'a> ToJSON for &'a str {
-    fn to_json(&self) -> Value {
-        Value::String(self.to_string())
+    fn to_json(&self) -> Option<Value> {
+        Some(Value::String(self.to_string()))
     }
 }

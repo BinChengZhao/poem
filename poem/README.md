@@ -20,9 +20,12 @@
     <img src="https://img.shields.io/badge/unsafe-forbidden-success.svg?style=flat-square"
       alt="Unsafe Rust forbidden" />
   </a>
-  <a href="https://blog.rust-lang.org/2021/07/29/Rust-1.54.0.html">
-    <img src="https://img.shields.io/badge/rustc-1.54+-ab6000.svg"
-      alt="rustc 1.54+" />
+  <a href="https://blog.rust-lang.org/2021/11/01/Rust-1.56.1.html">
+    <img src="https://img.shields.io/badge/rustc-1.56.1+-ab6000.svg"
+      alt="rustc 1.56.1+" />
+  </a>
+  <a href="https://discord.gg/qWWNxwasb7">
+    <img src="https://img.shields.io/discord/932986985604333638.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2" />
   </a>
 </div>
 <p align="center"><code>A program is like a poem, you cannot write a poem without writing it. --- Dijkstra</code></p>
@@ -30,7 +33,6 @@
 
 ***
 
-* [Book](https://poem-web.github.io/poem/)
 * [Docs](https://docs.rs/poem)
 * [Cargo package](https://crates.io/crates/poem)
 
@@ -47,19 +49,26 @@
 To avoid compiling unused dependencies, Poem gates certain features, all of
 which are disabled by default:
 
-|Feature           |Description                     |
-|------------------|--------------------------------|
-|cookie            | Support for Cookie             |
-|websocket         | Support for WebSocket          |
-|multipart         | Support for Multipart          |
-|sse               | Support Server-Sent Events (SSE)       |
-|tls               | Support for HTTP server over TLS   |
-|tempfile          | Support for [`tempfile`](https://crates.io/crates/tempfile) |
-|tower-compat      | Adapters for `tower::Layer` and `tower::Service`. |
-|session           | Support for CookieSession    |
-|redis-session     | Support for RedisSession     |
-|opentelemetry     | Support for opentelemetry    |
-|prometheus        | Support for Prometheus       |
+| Feature       | Description                                                                               |
+|---------------|-------------------------------------------------------------------------------------------|
+| compression   | Support decompress request body and compress response body                                |
+| cookie        | Support for Cookie                                                                        |
+| csrf          | Support for Cross-Site Request Forgery (CSRF) protection                                  |
+| multipart     | Support for Multipart                                                                     |
+| native-tls    | Support for HTTP server over TLS with [`native-tls`](https://crates.io/crates/native-tls) |
+| opentelemetry | Support for opentelemetry                                                                 |
+| prometheus    | Support for Prometheus                                                                    |
+| redis-session | Support for RedisSession                                                                  |
+| rustls        | Support for HTTP server over TLS with [`rustls`](https://crates.io/crates/rustls)         |
+| session       | Support for session                                                                       |
+| sse           | Support Server-Sent Events (SSE)                                                          |
+| static-files  | Support static files endpoint                                                             | 
+| tempfile      | Support for [`tempfile`](https://crates.io/crates/tempfile)                               |
+| tower-compat  | Adapters for `tower::Layer` and `tower::Service`.                                         |
+| websocket     | Support for WebSocket                                                                     |
+| anyhow        | Integrate with the [`anyhow`](https://crates.io/crates/anyhow) crate.                     |
+| eyre06        | Integrate with version 0.6.x of the [`eyre`](https://crates.io/crates/eyre) crate.        |
+| i18n          | Support for internationalization                                                          |
 
 ## Safety
 
@@ -78,9 +87,9 @@ fn hello(Path(name): Path<String>) -> String {
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     let app = Route::new().at("/hello/:name", get(hello));
-    let listener = TcpListener::bind("127.0.0.1:3000");
-    let server = Server::new(listener).await?;
-    server.run(app).await
+    Server::new(TcpListener::bind("127.0.0.1:3000"))
+      .run(app)
+      .await
 }
 ```
 
@@ -90,7 +99,7 @@ More examples can be found [here][examples].
 
 ## MSRV
 
-The minimum supported Rust version for this crate is `1.54.0`.
+The minimum supported Rust version for this crate is `1.56.1`.
 
 ## Contributing
 

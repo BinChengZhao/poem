@@ -5,9 +5,11 @@
 //! boilerplate code, so that you only need to focus on the more
 //! important business implementations.
 //!
-//! * [Book](https://poem-web.github.io/poem/)
-//! * [Docs](https://docs.rs/poem-openapi)
-//! * [Cargo package](https://crates.io/crates/poem-openapi)
+//! # Table of contents
+//!
+//! - [Features](#features)
+//! - [Quickstart](#quickstart)
+//! - [Crate features](#crate-features)
 //!
 //! ## Features
 //!
@@ -20,95 +22,119 @@
 //! * **Minimal overhead** All generated code is necessary, and there is almost
 //!   no overhead.
 //!
-//! ## Crate features
+//! ## Quickstart
 //!
-//! To avoid compiling unused dependencies, Poem gates certain features, some of
-//! which are disabled by default:
+//! Cargo.toml
 //!
-//! | Feature    | Description                      | Default enabled |
-//! | ---------- | -------------------------------- | --------------- |
-//! | chrono     | Integrate with the [`chrono` crate](https://crates.io/crates/chrono). | :x: |
-//! | swagger-ui | Add swagger UI support  | :heavy_check_mark: |
+//! ```toml
+//! [package]
+//! name = "helloworld"
+//! version = "0.1.0"
+//! edition = "2021"
 //!
-//! ## Example
+//! [dependencies]
+//! poem = "1.2"
+//! poem-openapi = { version = "1.2", features = ["swagger-ui"] }
+//! tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! ```
+//!
+//! main.rs
 //!
 //! ```no_run
-//! use poem::{listener::TcpListener, Route};
+//! use poem::{listener::TcpListener, Route, Server};
 //! use poem_openapi::{payload::PlainText, OpenApi, OpenApiService};
 //!
 //! struct Api;
 //!
 //! #[OpenApi]
 //! impl Api {
-//!     #[oai(path = "/hello", method = "get")]
-//!     async fn index(
-//!         &self,
-//!         #[oai(name = "name", in = "query")] name: Option<String>,
-//!     ) -> PlainText<String> {
-//!         match name {
-//!             Some(name) => PlainText(format!("hello, {}!", name)),
-//!             None => PlainText("hello!".to_string()),
-//!         }
+//!     /// Hello world
+//!     #[oai(path = "/", method = "get")]
+//!     async fn index(&self) -> PlainText<&'static str> {
+//!         PlainText("Hello World")
 //!     }
 //! }
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<(), std::io::Error> {
-//!     let listener = TcpListener::bind("127.0.0.1:3000");
-//!     let api_service = OpenApiService::new(Api)
-//!         .title("Hello World")
-//!         .server("http://localhost:3000/api");
-//!     let ui = api_service.swagger_ui();
+//! let api_service =
+//!     OpenApiService::new(Api, "Hello World", "1.0").server("http://localhost:3000");
+//! let docs = api_service.swagger_ui();
+//! let app = Route::new().nest("/", api_service).nest("/docs", docs);
 //!
-//!     poem::Server::new(listener)
-//!         .await?
-//!         .run(Route::new().nest("/api", api_service).nest("/", ui))
-//!         .await
-//! }
+//! # tokio::runtime::Runtime::new().unwrap().block_on(async {
+//! Server::new(TcpListener::bind("127.0.0.1:3000"))
+//!     .run(app)
+//!     .await;
+//! # });
 //! ```
 //!
-//! ## Run example
+//! ## Check it
 //!
-//! Open `http://localhost:3000/ui` in your browser, you will see the `Swagger UI` that contains these API definitions.
+//! Open your browser at [http://127.0.0.1:3000](http://127.0.0.1:3000).
 //!
-//! ```shell
-//! > cargo run --example hello_world
+//! You will see the plaintext response as:
 //!
-//! > curl http://localhost:3000
-//! hello!
-//!
-//! > curl http://localhost:3000\?name\=sunli
-//! hello, sunli!
+//! ```text
+//! Hello World
 //! ```
+//!
+//! ## Interactive API docs
+//!
+//! Now go to [http://127.0.0.1:3000/docs](http://127.0.0.1:3000/docs).
+//!
+//! You will see the automatic interactive API documentation (provided by
+//! [Swagger UI](https://github.com/swagger-api/swagger-ui)):
+//!
+//! ![swagger-ui](https://raw.githubusercontent.com/poem-web/poem/master/poem-openapi/assets/swagger-ui.jpg)
+//!
+//! ## Crate features
+//!
+//! To avoid compiling unused dependencies, Poem gates certain features, some of
+//! which are disabled by default:
+//!
+//! | Feature    | Description |
+//! |------------|-----------------------------------------------------------------------|
+//! | chrono     | Integrate with the [`chrono` crate](https://crates.io/crates/chrono). |
+//! | swagger-ui | Add swagger UI support |
+//! | rapidoc    | Add RapiDoc UI support |
+//! | redoc      | Add Redoc UI support |
+//! | email      | Support for email address string |
+//! | hostname   | Support for hostname string |
+//! | uuid       | Integrate with the [`uuid` crate](https://crates.io/crates/uuid)|
+//! | url        | Integrate with the [`url` crate](https://crates.io/crates/url) |
+//! | bson        | Integrate with the [`bson` crate](https://crates.io/crates/bson) |
+//! | static-files | Support for static file response |
 
-#![doc(html_favicon_url = "https://poem.rs/assets/favicon.ico")]
-#![doc(html_logo_url = "https://poem.rs/assets/logo.png")]
+#![doc(html_favicon_url = "https://raw.githubusercontent.com/poem-web/poem/master/favicon.ico")]
+#![doc(html_logo_url = "https://raw.githubusercontent.com/poem-web/poem/master/logo.png")]
 #![forbid(unsafe_code)]
 #![deny(private_in_public, unreachable_pub)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
+#[macro_use]
+mod macros;
+
 pub mod auth;
-mod base;
-mod error;
-mod openapi;
-#[doc(hidden)]
+pub mod error;
 pub mod param;
 pub mod payload;
 #[doc(hidden)]
 pub mod registry;
+pub mod response;
 pub mod types;
-#[doc(hidden)]
-#[cfg(feature = "swagger-ui")]
-pub mod ui;
 #[doc(hidden)]
 pub mod validation;
 
-pub use base::{ApiRequest, ApiResponse, CombinedAPI, OAuthScopes, OpenApi, SecurityScheme, Tags};
-pub use error::ParseRequestError;
-pub use openapi::OpenApiService;
-#[doc(hidden)]
-pub use poem;
+mod base;
+mod openapi;
+#[cfg(any(feature = "swagger-ui", feature = "rapidoc", feature = "redoc"))]
+mod ui;
+
+pub use base::{
+    ApiExtractor, ApiExtractorType, ApiResponse, ExtractParamOptions, OAuthScopes, OpenApi,
+    ResponseContent, Tags, Webhook,
+};
+pub use openapi::{ExternalDocumentObject, LicenseObject, OpenApiService, ServerObject};
 #[doc = include_str!("docs/request.md")]
 pub use poem_openapi_derive::ApiRequest;
 #[doc = include_str!("docs/response.md")]
@@ -117,19 +143,31 @@ pub use poem_openapi_derive::ApiResponse;
 pub use poem_openapi_derive::Enum;
 #[doc = include_str!("docs/multipart.md")]
 pub use poem_openapi_derive::Multipart;
+pub use poem_openapi_derive::NewType;
 #[doc = include_str!("docs/oauth_scopes.md")]
 pub use poem_openapi_derive::OAuthScopes;
 #[doc = include_str!("docs/object.md")]
 pub use poem_openapi_derive::Object;
-#[doc = include_str!("docs/oneof.md")]
-pub use poem_openapi_derive::OneOf;
 #[doc = include_str!("docs/openapi.md")]
 pub use poem_openapi_derive::OpenApi;
+#[doc = include_str!("docs/response_content.md")]
+pub use poem_openapi_derive::ResponseContent;
 #[doc = include_str!("docs/security_scheme.md")]
 pub use poem_openapi_derive::SecurityScheme;
 #[doc = include_str!("docs/tags.md")]
 pub use poem_openapi_derive::Tags;
+#[doc = include_str!("docs/union.md")]
+pub use poem_openapi_derive::Union;
+#[doc = include_str!("docs/webhook.md")]
+pub use poem_openapi_derive::Webhook;
+pub use validation::Validator;
+
 #[doc(hidden)]
-pub use serde;
-#[doc(hidden)]
-pub use serde_json;
+pub mod __private {
+    pub use mime;
+    pub use poem;
+    pub use serde;
+    pub use serde_json;
+
+    pub use crate::base::UrlQuery;
+}

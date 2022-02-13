@@ -1,43 +1,57 @@
 //! Commonly used listeners.
 
 mod combined;
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+mod handshake_stream;
+#[cfg(feature = "native-tls")]
+mod native_tls;
+#[cfg(feature = "rustls")]
+mod rustls;
 mod tcp;
-#[cfg(feature = "tls")]
+#[cfg(any(feature = "rustls", feature = "native-tls"))]
 mod tls;
 #[cfg(unix)]
 mod unix;
 
 use std::{
+    convert::Infallible,
     io::Error,
     pin::Pin,
     task::{Context, Poll},
 };
 
 pub use combined::{Combined, CombinedStream};
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+pub use handshake_stream::HandshakeStream;
+use http::uri::Scheme;
+#[cfg(feature = "native-tls")]
+pub use native_tls::{NativeTlsAcceptor, NativeTlsConfig, NativeTlsListener};
+#[cfg(feature = "rustls")]
+pub use rustls::{RustlsAcceptor, RustlsConfig, RustlsListener};
 pub use tcp::{TcpAcceptor, TcpListener};
-#[cfg(feature = "tls")]
-pub use tls::{TlsAcceptor, TlsConfig, TlsListener};
+#[cfg(any(feature = "rustls", feature = "native-tls"))]
+pub use tls::IntoTlsConfigStream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, Result as IoResult};
 #[cfg(unix)]
 pub use unix::{UnixAcceptor, UnixListener};
 
-use crate::web::RemoteAddr;
+use crate::web::{LocalAddr, RemoteAddr};
 
 /// Represents a acceptor type.
 #[async_trait::async_trait]
-pub trait Acceptor: Send + Sync {
+pub trait Acceptor: Send {
     /// IO stream type.
     type Io: AsyncRead + AsyncWrite + Send + Unpin + 'static;
 
     /// Returns the local address that this listener is bound to.
-    fn local_addr(&self) -> IoResult<Vec<RemoteAddr>>;
+    fn local_addr(&self) -> Vec<LocalAddr>;
 
     /// Accepts a new incoming connection from this listener.
     ///
     /// This function will yield once a new TCP connection is established. When
     /// established, the corresponding IO stream and the remote peer’s
     /// address will be returned.
-    async fn accept(&mut self) -> IoResult<(Self::Io, RemoteAddr)>;
+    async fn accept(&mut self) -> IoResult<(Self::Io, LocalAddr, RemoteAddr, Scheme)>;
 }
 
 /// An owned dynamically typed Acceptor for use in cases where you can’t
@@ -61,6 +75,28 @@ pub trait AcceptorExt: Acceptor {
         Self: Sized + 'static,
     {
         Box::new(WrappedAcceptor(self))
+    }
+
+    /// Consume this acceptor and return a new TLS acceptor with [`rustls`](https://crates.io/crates/rustls).
+    #[cfg(feature = "rustls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rustls")))]
+    fn rustls<S>(self, config_stream: S) -> RustlsAcceptor<Self, S>
+    where
+        Self: Sized,
+        S: futures_util::Stream<Item = RustlsConfig> + Send + Unpin + 'static,
+    {
+        RustlsAcceptor::new(self, config_stream)
+    }
+
+    /// Consume this acceptor and return a new TLS acceptor with [`native-tls`](https://crates.io/crates/native-tls).
+    #[cfg(feature = "native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
+    fn native_tls<S>(self, config_stream: S) -> NativeTlsAcceptor<Self, S>
+    where
+        Self: Sized,
+        S: futures_util::Stream<Item = NativeTlsConfig> + Send + Unpin + 'static,
+    {
+        NativeTlsAcceptor::new(self, config_stream)
     }
 }
 
@@ -94,15 +130,41 @@ pub trait Listener: Send {
         Combined::new(self, other)
     }
 
-    /// Consume this listener and return a new TLS listener.
-    #[cfg(feature = "tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
+    /// Consume this listener and return a new TLS listener with [`rustls`](https://crates.io/crates/rustls).
+    #[cfg(feature = "rustls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rustls")))]
     #[must_use]
-    fn tls(self, config: TlsConfig) -> TlsListener<Self>
+    fn rustls<S: IntoTlsConfigStream<RustlsConfig>>(
+        self,
+        config_stream: S,
+    ) -> RustlsListener<Self, S>
     where
         Self: Sized,
     {
-        TlsListener::new(config, self)
+        RustlsListener::new(self, config_stream)
+    }
+
+    /// Consume this listener and return a new TLS listener with [`native-tls`](https://crates.io/crates/native-tls).
+    #[cfg(feature = "native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
+    #[must_use]
+    fn native_tls<S: IntoTlsConfigStream<NativeTlsConfig>>(
+        self,
+        config_stream: S,
+    ) -> NativeTlsListener<Self, S>
+    where
+        Self: Sized,
+    {
+        NativeTlsListener::new(self, config_stream)
+    }
+}
+
+#[async_trait::async_trait]
+impl Listener for Infallible {
+    type Acceptor = Infallible;
+
+    async fn into_acceptor(self) -> IoResult<Self::Acceptor> {
+        unreachable!()
     }
 }
 
@@ -110,12 +172,25 @@ pub trait Listener: Send {
 impl<T: Acceptor + ?Sized> Acceptor for Box<T> {
     type Io = T::Io;
 
-    fn local_addr(&self) -> IoResult<Vec<RemoteAddr>> {
+    fn local_addr(&self) -> Vec<LocalAddr> {
         self.as_ref().local_addr()
     }
 
-    async fn accept(&mut self) -> IoResult<(Self::Io, RemoteAddr)> {
+    async fn accept(&mut self) -> IoResult<(Self::Io, LocalAddr, RemoteAddr, Scheme)> {
         self.as_mut().accept().await
+    }
+}
+
+#[async_trait::async_trait]
+impl Acceptor for Infallible {
+    type Io = BoxIo;
+
+    fn local_addr(&self) -> Vec<LocalAddr> {
+        vec![]
+    }
+
+    async fn accept(&mut self) -> IoResult<(Self::Io, LocalAddr, RemoteAddr, Scheme)> {
+        unreachable!()
     }
 }
 
@@ -173,15 +248,17 @@ struct WrappedAcceptor<T: Acceptor>(T);
 impl<T: Acceptor> Acceptor for WrappedAcceptor<T> {
     type Io = BoxIo;
 
-    fn local_addr(&self) -> IoResult<Vec<RemoteAddr>> {
-        self.0.local_addr().map(|addrs| addrs.into_iter().collect())
+    fn local_addr(&self) -> Vec<LocalAddr> {
+        self.0.local_addr()
     }
 
-    async fn accept(&mut self) -> IoResult<(Self::Io, RemoteAddr)> {
+    async fn accept(&mut self) -> IoResult<(Self::Io, LocalAddr, RemoteAddr, Scheme)> {
         self.0
             .accept()
             .await
-            .map(|(io, addr)| (BoxIo::new(io), addr))
+            .map(|(io, local_addr, remote_addr, scheme)| {
+                (BoxIo::new(io), local_addr, remote_addr, scheme)
+            })
     }
 }
 
@@ -189,26 +266,6 @@ impl<T: Acceptor> Acceptor for WrappedAcceptor<T> {
 mod tests {
     use super::{AcceptorExt, *};
     use crate::listener::TcpListener;
-
-    #[cfg(feature = "tls")]
-    #[tokio::test]
-    #[should_panic]
-    #[allow(unused_variables, unused_assignments)]
-    async fn test_box_acceptor() {
-        let mut a = TcpListener::bind("127.0.0.1:0")
-            .into_acceptor()
-            .await
-            .unwrap()
-            .boxed();
-
-        a = TcpListener::bind("127.0.0.1:0")
-            .tls(TlsConfig::new())
-            .combine(TcpListener::bind("127.0.0.1:0"))
-            .into_acceptor()
-            .await
-            .unwrap()
-            .boxed();
-    }
 
     #[tokio::test]
     async fn combined_listener() {

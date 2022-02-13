@@ -33,7 +33,7 @@ impl<T: Type> ParseError<T> {
     pub fn expected_type(actual: Value) -> Self {
         Self::new(format!(
             r#"Expected input type "{}", found {}."#,
-            T::NAME,
+            T::name(),
             actual
         ))
     }
@@ -41,19 +41,7 @@ impl<T: Type> ParseError<T> {
     /// Type A expects an input value.
     #[must_use]
     pub fn expected_input() -> Self {
-        Self::new(format!(r#"Type "{}" expects an input value."#, T::NAME))
-    }
-
-    /// This type does not support parsing from parameter.
-    #[must_use]
-    pub fn not_support_parsing_from_parameter() -> Self {
-        Self::custom("not support parsing from parameter")
-    }
-
-    /// This type does not support parsing from multipart.
-    #[must_use]
-    pub fn not_support_parsing_from_multipart() -> Self {
-        Self::custom("not support parsing from multipart")
+        Self::new(format!(r#"Type "{}" expects an input value."#, T::name()))
     }
 
     /// A custom error message.
@@ -62,16 +50,16 @@ impl<T: Type> ParseError<T> {
     /// you use the `?` operator.
     #[must_use]
     pub fn custom(msg: impl Display) -> Self {
-        Self::new(format!(r#"failed to parse "{}": {}"#, T::NAME, msg))
+        Self::new(format!(r#"failed to parse "{}": {}"#, T::name(), msg))
     }
 
     /// Propagate the error message to a different type.
     pub fn propagate<U: Type>(self) -> ParseError<U> {
-        if T::NAME != U::NAME {
+        if T::name() != U::name() {
             ParseError::new(format!(
                 r#"{} (occurred while parsing "{}")"#,
                 self.message,
-                U::NAME
+                U::name()
             ))
         } else {
             ParseError::new(self.message)

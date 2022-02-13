@@ -22,7 +22,11 @@ use crate::{
 /// The `SameSite` cookie attribute.
 pub type SameSite = libcookie::SameSite;
 
-/// Representation of an HTTP cookie.
+/// HTTP cookie extractor.
+///
+/// # Errors
+///
+/// - [`ParseCookieError`]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cookie(libcookie::Cookie<'static>);
 
@@ -227,13 +231,13 @@ impl Cookie {
     /// Sets the expires field of `self` to `time`.
     pub fn set_expires(&mut self, time: DateTime<impl TimeZone>) {
         self.0.set_expires(libcookie::Expiration::DateTime(
-            time::OffsetDateTime::from_unix_timestamp(time.timestamp()),
+            time::OffsetDateTime::from_unix_timestamp(time.timestamp()).unwrap(),
         ));
     }
 
     /// Sets the value of `HttpOnly` in `self` to `value`.
-    pub fn set_http_only(&mut self, value: bool) {
-        self.0.set_http_only(Some(value));
+    pub fn set_http_only(&mut self, value: impl Into<Option<bool>>) {
+        self.0.set_http_only(value);
     }
 
     /// Sets the value of `MaxAge` in `self` to `value`.
@@ -255,12 +259,12 @@ impl Cookie {
     }
 
     /// Sets the value of `SameSite` in `self` to `value`.
-    pub fn set_same_site(&mut self, value: SameSite) {
+    pub fn set_same_site(&mut self, value: impl Into<Option<SameSite>>) {
         self.0.set_same_site(value);
     }
 
     /// Sets the value of `Secure` in `self` to `value`.
-    pub fn set_secure(&mut self, value: bool) {
+    pub fn set_secure(&mut self, value: impl Into<Option<bool>>) {
         self.0.set_secure(value);
     }
 
@@ -289,9 +293,7 @@ impl Cookie {
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for Cookie {
-    type Error = ParseCookieError;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
         let value = req
             .headers()
             .get(header::COOKIE)
@@ -333,14 +335,15 @@ impl<'a> FromRequest<'a> for Cookie {
 ///     .at("/", get(index))
 ///     .with(CookieJarManager::new());
 ///
-/// let resp = app.call(Request::default()).await;
+/// let resp = app.call(Request::default()).await.unwrap();
 /// assert_eq!(resp.status(), StatusCode::OK);
 /// let cookie = resp.headers().get(header::SET_COOKIE).cloned().unwrap();
 /// assert_eq!(resp.into_body().into_string().await.unwrap(), "count: 1");
 ///
 /// let resp = app
 ///     .call(Request::builder().header(header::COOKIE, cookie).finish())
-///     .await;
+///     .await
+///     .unwrap();
 /// assert_eq!(resp.into_body().into_string().await.unwrap(), "count: 2");
 /// # });
 /// ```
@@ -489,26 +492,35 @@ impl FromStr for CookieJar {
 
 #[async_trait::async_trait]
 impl<'a> FromRequest<'a> for &'a CookieJar {
-    type Error = Infallible;
-
-    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
         Ok(req.cookie())
     }
 }
 
 impl CookieJar {
     pub(crate) fn extract_from_headers(headers: &HeaderMap) -> Self {
-        headers
-            .get(header::COOKIE)
-            .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_default()
+        let mut cookie_jar = libcookie::CookieJar::new();
+
+        for value in headers.get_all(header::COOKIE) {
+            if let Ok(value) = value.to_str() {
+                for cookie_str in value.split(';').map(str::trim) {
+                    if let Ok(cookie) = libcookie::Cookie::parse_encoded(cookie_str) {
+                        cookie_jar.add_original(cookie.into_owned());
+                    }
+                }
+            }
+        }
+
+        CookieJar {
+            jar: Arc::new(Mutex::new(cookie_jar)),
+            key: None,
+        }
     }
 
     pub(crate) fn append_delta_to_headers(&self, headers: &mut HeaderMap) {
         let cookie = self.jar.lock();
         for cookie in cookie.delta() {
-            let value = cookie.to_string();
+            let value = cookie.encoded().to_string();
             if let Ok(value) = HeaderValue::from_str(&value) {
                 headers.append(header::SET_COOKIE, value);
             }
@@ -674,5 +686,16 @@ mod tests {
         let new_key = CookieKey::generate();
         let signed = cookie_jar.signed_with_key(&new_key);
         assert_eq!(signed.get("a"), None);
+    }
+
+    #[test]
+    fn test_extract_from_multiple_cookie_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("a=1"));
+        headers.append(header::COOKIE, HeaderValue::from_static("b=2; c=3"));
+        let cookie_jar = CookieJar::extract_from_headers(&headers);
+        assert_eq!(cookie_jar.get("a").unwrap().value_str(), "1");
+        assert_eq!(cookie_jar.get("b").unwrap().value_str(), "2");
+        assert_eq!(cookie_jar.get("c").unwrap().value_str(), "3");
     }
 }

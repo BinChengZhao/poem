@@ -5,44 +5,66 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::SystemTime,
 };
 
+use http::uri::Scheme;
 use hyper::server::conn::Http;
 use tokio::{
     io::{AsyncRead, AsyncWrite, Result as IoResult},
     sync::Notify,
     time::Duration,
 };
-use tracing::{Instrument, Level};
 
 use crate::{
-    listener::{Acceptor, Listener},
-    web::RemoteAddr,
+    listener::{Acceptor, AcceptorExt, Listener},
+    web::{LocalAddr, RemoteAddr},
     Endpoint, EndpointExt, IntoEndpoint, Response,
 };
 
-/// An HTTP Server.
-pub struct Server<T> {
-    acceptor: T,
+enum Either<L, A> {
+    Listener(L),
+    Acceptor(A),
 }
 
-impl<T: Acceptor> Server<T> {
+/// An HTTP Server.
+pub struct Server<L, A> {
+    listener: Either<L, A>,
+    name: Option<String>,
+}
+
+impl<L: Listener> Server<L, Infallible> {
     /// Use the specified listener to create an HTTP server.
-    pub async fn new<K: Listener<Acceptor = T>>(listener: K) -> IoResult<Server<T>> {
-        Ok(Self {
-            acceptor: listener.into_acceptor().await?,
-        })
+    pub fn new(listener: L) -> Self {
+        Self {
+            listener: Either::Listener(listener),
+            name: None,
+        }
     }
+}
 
+impl<A: Acceptor> Server<Infallible, A> {
     /// Use the specified acceptor to create an HTTP server.
-    pub fn new_with_acceptor(acceptor: T) -> Self {
-        Self { acceptor }
+    pub fn new_with_acceptor(acceptor: A) -> Self {
+        Self {
+            listener: Either::Acceptor(acceptor),
+            name: None,
+        }
     }
+}
 
-    /// Returns the local address that this server is bound to.
-    pub fn local_addr(&self) -> IoResult<Vec<RemoteAddr>> {
-        self.acceptor.local_addr()
+impl<L, A> Server<L, A>
+where
+    L: Listener,
+    L::Acceptor: 'static,
+    A: Acceptor + 'static,
+{
+    /// Specify the name of the server, it is only used for logs.
+    #[must_use]
+    pub fn name(self, name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            ..self
+        }
     }
 
     /// Run this server.
@@ -66,25 +88,31 @@ impl<T: Acceptor> Server<T> {
         E: IntoEndpoint,
         E::Endpoint: 'static,
     {
-        let ep = ep.into_endpoint();
-        let ep = Arc::new(ep.map_to_response());
-        let Server { mut acceptor } = self;
+        let ep = Arc::new(ep.into_endpoint().map_to_response());
+        let Server { listener, name } = self;
+        let name = name.as_deref();
         let alive_connections = Arc::new(AtomicUsize::new(0));
         let notify = Arc::new(Notify::new());
         let timeout_notify = Arc::new(Notify::new());
 
+        let mut acceptor = match listener {
+            Either::Listener(listener) => listener.into_acceptor().await?.boxed(),
+            Either::Acceptor(acceptor) => acceptor.boxed(),
+        };
+
         tokio::pin!(signal);
 
-        for addr in acceptor.local_addr()? {
-            tracing::info!(addr = %addr, "listening");
+        for addr in acceptor.local_addr() {
+            tracing::info!(name = name, addr = %addr, "listening");
         }
-        tracing::info!("server started");
+        tracing::info!(name = name, "server started");
 
         loop {
             tokio::select! {
                 _ = &mut signal => {
                     if let Some(timeout) = timeout {
                         tracing::info!(
+                            name = name,
                             timeout_in_seconds = timeout.as_secs_f32(),
                             "initiate graceful shutdown",
                         );
@@ -95,12 +123,12 @@ impl<T: Acceptor> Server<T> {
                             timeout_notify.notify_waiters();
                         });
                     } else {
-                        tracing::info!("initiate graceful shutdown");
+                        tracing::info!(name = name, "initiate graceful shutdown");
                     }
                     break;
                 },
                 res = acceptor.accept() => {
-                    if let Ok((socket, remote_addr)) = res {
+                    if let Ok((socket, local_addr, remote_addr, scheme)) = res {
                         let ep = ep.clone();
                         let alive_connections = alive_connections.clone();
                         let notify = notify.clone();
@@ -111,11 +139,11 @@ impl<T: Acceptor> Server<T> {
 
                             if timeout.is_some() {
                                 tokio::select! {
-                                    _ = serve_connection(socket, remote_addr, ep) => {}
+                                    _ = serve_connection(socket, local_addr, remote_addr, scheme, ep) => {}
                                     _ = timeout_notify.notified() => {}
                                 }
                             } else {
-                                serve_connection(socket, remote_addr, ep).await;
+                                serve_connection(socket, local_addr, remote_addr, scheme, ep).await;
                             }
 
                             if alive_connections.fetch_sub(1, Ordering::SeqCst) == 1 {
@@ -129,61 +157,40 @@ impl<T: Acceptor> Server<T> {
 
         drop(acceptor);
         if alive_connections.load(Ordering::SeqCst) > 0 {
-            tracing::info!("wait for all connections to close.");
+            tracing::info!(name = name, "wait for all connections to close.");
             notify.notified().await;
         }
 
-        tracing::info!("server stopped");
+        tracing::info!(name = name, "server stopped");
         Ok(())
     }
 }
 
 async fn serve_connection(
     socket: impl AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    local_addr: LocalAddr,
     remote_addr: RemoteAddr,
+    scheme: Scheme,
     ep: Arc<dyn Endpoint<Output = Response>>,
 ) {
     let service = hyper::service::service_fn({
         move |req: hyper::Request<hyper::Body>| {
             let ep = ep.clone();
+            let local_addr = local_addr.clone();
             let remote_addr = remote_addr.clone();
+            let scheme = scheme.clone();
             async move {
-                let span = tracing::span!(
-                    target: module_path!(),
-                    Level::INFO,
-                    "request",
-                    remote_addr = %remote_addr,
-                    version = ?req.version(),
-                    method = %req.method(),
-                    path = %req.uri(),
-                );
-
-                let fut = async move {
-                    let now = SystemTime::now();
-                    let resp: http::Response<hyper::Body> =
-                        ep.call((req, remote_addr).into()).await.into();
-                    match now.elapsed() {
-                        Ok(duration) => tracing::info!(
-                            status = %resp.status(),
-                            duration = ?duration,
-                            "response"
-                        ),
-                        Err(_) => tracing::info!(
-                            status = %resp.status(),
-                            "response"
-                        ),
-                    }
-                    resp
-                }
-                .instrument(span);
-
-                Ok::<_, Infallible>(fut.await)
+                Ok::<http::Response<_>, Infallible>(
+                    ep.get_response((req, local_addr, remote_addr, scheme).into())
+                        .await
+                        .into(),
+                )
             }
         }
     });
 
-    let conn = Http::new().serve_connection(socket, service);
-    #[cfg(feature = "websocket")]
-    let conn = conn.with_upgrades();
+    let conn = Http::new()
+        .serve_connection(socket, service)
+        .with_upgrades();
     let _ = conn.await;
 }

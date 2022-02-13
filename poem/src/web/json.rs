@@ -1,18 +1,22 @@
 use std::ops::{Deref, DerefMut};
 
+use http::StatusCode;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
-    error::ParseJsonError, http::header, web::RequestBody, Error, FromRequest, IntoResponse,
-    Request, Response, Result,
+    error::ParseJsonError, http::header, web::RequestBody, FromRequest, IntoResponse, Request,
+    Response, Result,
 };
 
 /// JSON extractor and response.
 ///
-/// # Extractor
-///
 /// To extract the specified type of JSON from the body, `T` must implement
 /// [`serde::Deserialize`].
+///
+/// # Errors
+///
+/// - [`ReadBodyError`](crate::error::ReadBodyError)
+/// - [`ParseJsonError`]
 ///
 /// ```
 /// use poem::{
@@ -42,7 +46,8 @@ use crate::{
 ///             .method(Method::POST)
 ///             .body(r#"{"name": "foo"}"#),
 ///     )
-///     .await;
+///     .await
+///     .unwrap();
 /// assert_eq!(resp.status(), StatusCode::OK);
 /// assert_eq!(
 ///     resp.into_body().into_string().await.unwrap(),
@@ -74,7 +79,7 @@ use crate::{
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let app = Route::new().at("/", get(index));
-/// let resp = app.call(Request::default()).await;
+/// let resp = app.call(Request::default()).await.unwrap();
 /// assert_eq!(resp.status(), StatusCode::OK);
 /// assert_eq!(
 ///     resp.into_body().into_string().await.unwrap(),
@@ -101,11 +106,9 @@ impl<T> DerefMut for Json<T> {
 
 #[async_trait::async_trait]
 impl<'a, T: DeserializeOwned> FromRequest<'a> for Json<T> {
-    type Error = ParseJsonError;
-
-    async fn from_request(_req: &'a Request, body: &mut RequestBody) -> Result<Self, Self::Error> {
+    async fn from_request(_req: &'a Request, body: &mut RequestBody) -> Result<Self> {
         let data = body.take()?.into_bytes().await?;
-        Ok(Self(serde_json::from_slice(&data)?))
+        Ok(Self(serde_json::from_slice(&data).map_err(ParseJsonError)?))
     }
 }
 
@@ -113,10 +116,14 @@ impl<T: Serialize + Send> IntoResponse for Json<T> {
     fn into_response(self) -> Response {
         let data = match serde_json::to_vec(&self.0) {
             Ok(data) => data,
-            Err(err) => return Error::internal_server_error(err).as_response(),
+            Err(err) => {
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(err.to_string())
+            }
         };
         Response::builder()
-            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_TYPE, "application/json; charset=utf8")
             .body(data)
     }
 }
@@ -160,7 +167,8 @@ mod tests {
                     "#,
                     ),
             )
-            .await;
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -173,7 +181,7 @@ mod tests {
             })
         }
 
-        let mut resp = index.call(Request::default()).await;
+        let mut resp = index.call(Request::default()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             serde_json::from_str::<CreateResource>(&resp.take_body().into_string().await.unwrap())

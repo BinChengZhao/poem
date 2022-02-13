@@ -1,5 +1,3 @@
-use std::convert::TryFrom;
-
 use darling::{
     ast::{Data, Style},
     util::{Ignored, SpannedValue},
@@ -11,7 +9,6 @@ use quote::quote;
 use syn::{Attribute, DeriveInput, Error, Path};
 
 use crate::{
-    common_args::RenameTarget,
     error::GeneratorResult,
     utils::{get_crate_name, get_description, optional_literal},
 };
@@ -211,6 +208,8 @@ struct SecuritySchemeArgs {
     flows: Option<SpannedValue<OAuthFlows>>,
     #[darling(default)]
     openid_connect_url: Option<String>,
+    #[darling(default)]
+    checker: Option<Path>,
 }
 
 impl SecuritySchemeArgs {
@@ -226,13 +225,12 @@ impl SecuritySchemeArgs {
     fn validate_api_key(&self) -> GeneratorResult<()> {
         match &self.key_name {
             Some(name) => {
-                if HeaderName::try_from(&**name).is_err() {
-                    return Err(Error::new(
+                HeaderName::try_from(&**name).map_err(|_| {
+                    Error::new(
                         name.span(),
                         format!("`{}` is not a valid header name.", &**name),
                     )
-                    .into());
-                }
+                })?;
             }
             None => {
                 return Err(Error::new_spanned(
@@ -284,6 +282,7 @@ impl SecuritySchemeArgs {
     fn generate_register_security_scheme(
         &self,
         crate_name: &TokenStream,
+        name: &str,
     ) -> GeneratorResult<TokenStream> {
         let description = get_description(&self.attrs)?;
         let description = optional_literal(&description);
@@ -313,7 +312,7 @@ impl SecuritySchemeArgs {
         let ts = match self.ty {
             AuthType::ApiKey => {
                 quote! {
-                    registry.create_security_scheme(Self::NAME, #crate_name::registry::MetaSecurityScheme {
+                    registry.create_security_scheme(#name, #crate_name::registry::MetaSecurityScheme {
                         ty: "apiKey",
                         description: #description,
                         name: #key_name,
@@ -327,7 +326,7 @@ impl SecuritySchemeArgs {
             }
             AuthType::Basic => {
                 quote! {
-                    registry.create_security_scheme(Self::NAME, #crate_name::registry::MetaSecurityScheme {
+                    registry.create_security_scheme(#name, #crate_name::registry::MetaSecurityScheme {
                         ty: "http",
                         description: #description,
                         name: ::std::option::Option::None,
@@ -341,7 +340,7 @@ impl SecuritySchemeArgs {
             }
             AuthType::Bearer => {
                 quote! {
-                    registry.create_security_scheme(Self::NAME, #crate_name::registry::MetaSecurityScheme {
+                    registry.create_security_scheme(#name, #crate_name::registry::MetaSecurityScheme {
                         ty: "http",
                         description: #description,
                         name: ::std::option::Option::None,
@@ -356,7 +355,7 @@ impl SecuritySchemeArgs {
             AuthType::OAuth2 => {
                 let flows = self.flows.as_ref().unwrap().generate_meta(crate_name)?;
                 quote! {
-                    registry.create_security_scheme(Self::NAME, #crate_name::registry::MetaSecurityScheme {
+                    registry.create_security_scheme(#name, #crate_name::registry::MetaSecurityScheme {
                         ty: "oauth2",
                         description: #description,
                         name: ::std::option::Option::None,
@@ -370,7 +369,7 @@ impl SecuritySchemeArgs {
             }
             AuthType::OpenIdConnect => {
                 quote! {
-                    registry.create_security_scheme(Self::NAME, #crate_name::registry::MetaSecurityScheme {
+                    registry.create_security_scheme(#name, #crate_name::registry::MetaSecurityScheme {
                         ty: "openIdConnect",
                         description: #description,
                         name: ::std::option::Option::None,
@@ -395,13 +394,19 @@ impl SecuritySchemeArgs {
                     ApiKeyInType::Header => quote!(#crate_name::registry::MetaParamIn::Header),
                     ApiKeyInType::Cookie => quote!(#crate_name::registry::MetaParamIn::Cookie),
                 };
-                quote!(#crate_name::auth::ApiKeyAuthorization::from_request(req, query, #key_name, #param_in))
+                quote!(<#crate_name::auth::ApiKey as #crate_name::auth::ApiKeyAuthorization>::from_request(req, query, #key_name, #param_in))
             }
-            AuthType::Basic => quote!(#crate_name::auth::BasicAuthorization::from_request(req)),
-            AuthType::Bearer => quote!(#crate_name::auth::BearerAuthorization::from_request(req)),
-            AuthType::OAuth2 => quote!(#crate_name::auth::BearerAuthorization::from_request(req)),
+            AuthType::Basic => {
+                quote!(<#crate_name::auth::Basic as #crate_name::auth::BasicAuthorization>::from_request(req))
+            }
+            AuthType::Bearer => {
+                quote!(<#crate_name::auth::Bearer as #crate_name::auth::BearerAuthorization>::from_request(req))
+            }
+            AuthType::OAuth2 => {
+                quote!(<#crate_name::auth::Bearer as #crate_name::auth::BearerAuthorization>::from_request(req))
+            }
             AuthType::OpenIdConnect => {
-                quote!(#crate_name::auth::BearerAuthorization::from_request(req))
+                quote!(<#crate_name::auth::Bearer as #crate_name::auth::BearerAuthorization>::from_request(req))
             }
         }
     }
@@ -411,10 +416,7 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
     let args: SecuritySchemeArgs = SecuritySchemeArgs::from_derive_input(&args)?;
     let crate_name = get_crate_name(args.internal);
     let ident = &args.ident;
-    let oai_typename = args
-        .rename
-        .clone()
-        .unwrap_or_else(|| RenameTarget::SecurityScheme.rename(ident.to_string()));
+    let oai_typename = args.rename.clone().unwrap_or_else(|| ident.to_string());
     args.validate()?;
 
     let fields = match &args.data {
@@ -431,24 +433,45 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
     if fields.style == Style::Tuple && fields.fields.len() != 1 {
         return Err(Error::new_spanned(
             ident,
-            "Only one unnamed field is allowed in the SecurityScheme structure.",
+            "Only one unnamed field is allowed in the SecurityScheme struct.",
         )
         .into());
     }
 
-    let register_security_scheme = args.generate_register_security_scheme(&crate_name)?;
+    let register_security_scheme =
+        args.generate_register_security_scheme(&crate_name, &oai_typename)?;
     let from_request = args.generate_from_request(&crate_name);
+    let checker = args.checker.as_ref().map(|path| {
+        quote! {
+            let output = ::std::option::Option::ok_or(#path(&req, output).await, #crate_name::error::AuthorizationError)?;
+        }
+    });
 
     let expanded = quote! {
-        impl #crate_name::SecurityScheme for #ident {
-            const NAME: &'static str = #oai_typename;
+        #[#crate_name::__private::poem::async_trait]
+        impl<'a> #crate_name::ApiExtractor<'a> for #ident {
+            const TYPE: #crate_name::ApiExtractorType = #crate_name::ApiExtractorType::SecurityScheme;
+
+            type ParamType = ();
+            type ParamRawType = ();
 
             fn register(registry: &mut #crate_name::registry::Registry) {
                 #register_security_scheme
             }
 
-            fn from_request(req: &#crate_name::poem::Request, query: &::std::collections::HashMap<::std::string::String, ::std::string::String>) -> ::std::result::Result<Self, #crate_name::ParseRequestError> {
-                #from_request.map(Self)
+            fn security_scheme() -> ::std::option::Option<&'static str> {
+                ::std::option::Option::Some(#oai_typename)
+            }
+
+            async fn from_request(
+                req: &'a #crate_name::__private::poem::Request,
+                body: &mut #crate_name::__private::poem::RequestBody,
+                _param_opts: #crate_name::ExtractParamOptions<Self::ParamType>,
+            ) -> #crate_name::__private::poem::Result<Self> {
+                let query = req.extensions().get::<#crate_name::__private::UrlQuery>().unwrap();
+                let output = #from_request?;
+                #checker
+                ::std::result::Result::Ok(Self(output))
             }
         }
     };

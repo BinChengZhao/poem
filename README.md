@@ -9,9 +9,12 @@
     <img src="https://img.shields.io/badge/unsafe-forbidden-success.svg?style=flat-square"
       alt="Unsafe Rust forbidden" />
   </a>
-  <a href="https://blog.rust-lang.org/2021/07/29/Rust-1.54.0.html">
-    <img src="https://img.shields.io/badge/rustc-1.54+-ab6000.svg"
-      alt="rustc 1.54+" />
+  <a href="https://blog.rust-lang.org/2021/11/01/Rust-1.56.1.html">
+    <img src="https://img.shields.io/badge/rustc-1.56.1+-ab6000.svg"
+      alt="rustc 1.56.1+" />
+  </a>
+  <a href="https://discord.gg/qWWNxwasb7">
+    <img src="https://img.shields.io/discord/932986985604333638.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2" />
   </a>
 </div>
 <p align="center"><code>A program is like a poem, you cannot write a poem without writing it. --- Dijkstra</code></p>
@@ -21,11 +24,23 @@
 
 This repo contains the following main components:
 
-| Crate                                                  | Description                     | Documentation                      | ChangeLog                                    |
-|--------------------------------------------------------|---------------------------------|------------------------------------|----------------------------------------------|
-|[poem](https://crates.io/crates/poem)                   | Poem Web                        | [(README)](poem/README.md)         | [(CHANGELOG)](poem/CHANGELOG.md)             |
-|[poem-lambda](https://crates.io/crates/poem-lambda)     | Poem for AWS Lambda             | [(README)](poem-lambda/README.md)  |                                              |
-|[poem-openapi](https://crates.io/crates/poem-openapi)   | OpenAPI for Poem Web            | [(README)](poem-openapi/README.md) | [(CHANGELOG)](poem-openapi/CHANGELOG.md)     |
+| Crate                                                     | Description                    | Documentation                        | ChangeLog                                  |
+|-----------------------------------------------------------|--------------------------------|--------------------------------------|--------------------------------------------|
+| [poem](https://crates.io/crates/poem)                     | Poem Web                       | [(README)](poem/README.md)           | [(CHANGELOG)](poem/CHANGELOG.md)           |
+| [poem-lambda](https://crates.io/crates/poem-lambda)       | Poem for AWS Lambda            | [(README)](poem-lambda/README.md)    | [(CHANGELOG)](poem-lambda/CHANGELOG.md)    |
+| [poem-openapi](https://crates.io/crates/poem-openapi)     | OpenAPI for Poem Web           | [(README)](poem-openapi/README.md)   | [(CHANGELOG)](poem-openapi/CHANGELOG.md)   |
+| [poem-dbsession](https://crates.io/crates/poem-dbsession) | Session storage using database | [(README)](poem-dbsession/README.md) | [(CHANGELOG)](poem-dbsession/CHANGELOG.md) |
+
+***
+
+The following are cases of community use:
+
+| Repo                                                                             | Description                                                                                                            | Documentation                                                    | ChangeLog                                                                      |
+|----------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------|--------------------------------------------------------------------------------|
+| [delicate](https://github.com/BinChengZhao/delicate)                             | A distributed task scheduling platform written in rust.                                                                | [(README)](https://delicate-rs.github.io/Roadmap.html)           | [(CHANGELOG)](https://github.com/BinChengZhao/delicate/blob/main/CHANGELOG.md) |         
+| [databend](https://github.com/datafuselabs/databend)                             | A cloud-native data warehouse written in rust.                                                                         | [(ROADMAP)](https://github.com/datafuselabs/databend/issues/746) | [(WEEKLY)](https://github.com/datafuselabs/weekly)                             |
+| [muse](https://leihuo.163.com/)                                                  | A NetEase Leihuo's internal art resource sharing platform, backend in rust.                                            |                                                                  |                                                                                |
+| [hik-proconnect](https://www.hikvision.com/en/products/software/hik-proconnect/) | A front-end automated deployment platform based on continuous integration of aws. Hik-ProConnect project for Hikvision |                                                                  |                                                                                |
 
 
 ***
@@ -38,7 +53,6 @@ The following are cases of community use:
 
 ### Resources
 
-- [Book](https://poem.rs)
 - [Examples](https://github.com/poem-web/poem/tree/master/examples)
 
 ## Contributing

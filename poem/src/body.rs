@@ -1,20 +1,30 @@
 use std::{
-    fmt::Display,
+    fmt::{Debug, Display, Formatter},
     io::{Error as IoError, ErrorKind},
     pin::Pin,
     task::{Context, Poll},
 };
 
-use bytes::Bytes;
-use futures_util::Stream;
+use bytes::{Bytes, BytesMut};
+use futures_util::{Stream, TryStreamExt};
 use hyper::body::HttpBody;
-use tokio::io::AsyncRead;
+use serde::{de::DeserializeOwned, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::error::ReadBodyError;
+use crate::{
+    error::{ParseJsonError, ReadBodyError},
+    Result,
+};
 
 /// A body object for requests and responses.
 #[derive(Default)]
 pub struct Body(pub(crate) hyper::Body);
+
+impl Debug for Body {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Body").finish()
+    }
+}
 
 impl From<hyper::Body> for Body {
     fn from(body: hyper::Body) -> Self {
@@ -97,6 +107,21 @@ impl Body {
         )))
     }
 
+    /// Create a body object from bytes stream.
+    pub fn from_bytes_stream<S, O, E>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<O, E>> + Send + 'static,
+        O: Into<Bytes> + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self(hyper::Body::wrap_stream(stream))
+    }
+
+    /// Create a body object from JSON.
+    pub fn from_json(body: impl Serialize) -> serde_json::Result<Self> {
+        Ok(serde_json::to_vec(&body)?.into())
+    }
+
     /// Create an empty body.
     #[inline]
     pub fn empty() -> Self {
@@ -119,19 +144,73 @@ impl Body {
             .to_vec())
     }
 
+    /// Consumes this body object to return a [`Bytes`] that contains all
+    /// data, returns `Err(ReadBodyError::PayloadTooLarge)` if the length of the
+    /// payload exceeds `limit`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use poem::{error::ReadBodyError, handler, http::StatusCode, Body, Endpoint, Request, Result};
+    ///
+    /// #[handler]
+    /// async fn index(data: Body) -> Result<()> {
+    ///     Ok(data.into_bytes_limit(5).await.map(|_| ())?)
+    /// }
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let req = Request::builder().body("12345");
+    /// assert_eq!(index.get_response(req).await.status(), StatusCode::OK);
+    ///
+    /// let req = Request::builder().body("123456");
+    /// assert_eq!(
+    ///     index.get_response(req).await.status(),
+    ///     StatusCode::PAYLOAD_TOO_LARGE
+    /// );
+    /// # });
+    /// ```
+    pub async fn into_bytes_limit(self, limit: usize) -> Result<Bytes, ReadBodyError> {
+        let mut reader = self.into_async_read();
+        let mut buf = [0; 4096];
+        let mut data = BytesMut::new();
+
+        loop {
+            let sz = reader.read(&mut buf).await?;
+            if sz == 0 {
+                break;
+            }
+            if data.len() + sz > limit {
+                return Err(ReadBodyError::PayloadTooLarge);
+            }
+            data.extend_from_slice(&buf[..sz]);
+        }
+
+        Ok(data.freeze())
+    }
+
     /// Consumes this body object to return a [`String`] that contains all data.
     pub async fn into_string(self) -> Result<String, ReadBodyError> {
-        Ok(String::from_utf8(
-            self.into_bytes()
-                .await
-                .map_err(|err| ReadBodyError::Io(IoError::new(ErrorKind::Other, err)))?
-                .to_vec(),
-        )?)
+        Ok(String::from_utf8(self.into_bytes().await?.to_vec())?)
+    }
+
+    /// Consumes this body object and parse it as `T`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReadBodyError`]
+    /// - [`ParseJsonError`]
+    pub async fn into_json<T: DeserializeOwned>(self) -> Result<T> {
+        Ok(serde_json::from_slice(&self.into_vec().await?).map_err(ParseJsonError)?)
     }
 
     /// Consumes this body object to return a reader.
     pub fn into_async_read(self) -> impl AsyncRead + Unpin + Send + 'static {
         tokio_util::io::StreamReader::new(BodyStream::new(self.0))
+    }
+
+    /// Consumes this body object to return a bytes stream.
+    pub fn into_bytes_stream(self) -> impl Stream<Item = Result<Bytes, IoError>> + Send + 'static {
+        TryStreamExt::map_err(self.0, |err| IoError::new(ErrorKind::Other, err))
     }
 }
 
@@ -209,5 +288,8 @@ mod tests {
             ),
         ));
         assert_eq!(body.into_string().await.unwrap(), "abcdefghi");
+
+        let body = Body::from_json("abc").unwrap();
+        assert_eq!(body.into_json::<String>().await.unwrap(), "abc");
     }
 }

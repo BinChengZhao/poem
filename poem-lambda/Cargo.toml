@@ -1,8 +1,8 @@
 [package]
 name = "poem-lambda"
-version = "1.0.3"
+version = "1.2.57"
 authors = ["sunli <scott_s829@163.com>"]
-edition = "2018"
+edition = "2021"
 description = "Poem for AWS Lambda"
 license = "MIT/Apache-2.0"
 documentation = "https://docs.rs/poem/"
@@ -17,7 +17,8 @@ categories = [
 ]
 
 [dependencies]
-poem = { path = "../poem", version = "1.0.0" }
+poem = { path = "../poem", version = "1.2.57" }
+
 lambda_http = { version = "0.4.1" }
 
 [dev-dependencies]

@@ -1,11 +1,11 @@
+use std::borrow::Cow;
+
 use poem::web::Field as PoemField;
 use serde_json::Value;
 
 use crate::{
     registry::{MetaSchemaRef, Registry},
-    types::{
-        ParseError, ParseFromJSON, ParseFromMultipartField, ParseResult, ToJSON, Type, TypeName,
-    },
+    types::{ParseError, ParseFromJSON, ParseFromMultipartField, ParseResult, ToJSON, Type},
 };
 
 /// A JSON type for multipart field.
@@ -13,9 +13,15 @@ use crate::{
 pub struct JsonField<T>(pub T);
 
 impl<T: Type> Type for JsonField<T> {
-    const NAME: TypeName = T::NAME;
+    const IS_REQUIRED: bool = true;
 
-    type ValueType = T::ValueType;
+    type RawValueType = T::RawValueType;
+
+    type RawElementValueType = T::RawElementValueType;
+
+    fn name() -> Cow<'static, str> {
+        T::name()
+    }
 
     #[inline]
     fn schema_ref() -> MetaSchemaRef {
@@ -27,8 +33,14 @@ impl<T: Type> Type for JsonField<T> {
     }
 
     #[inline]
-    fn as_value(&self) -> Option<&Self::ValueType> {
-        self.0.as_value()
+    fn as_raw_value(&self) -> Option<&Self::RawValueType> {
+        self.0.as_raw_value()
+    }
+
+    fn raw_element_iter<'a>(
+        &'a self,
+    ) -> Box<dyn Iterator<Item = &'a Self::RawElementValueType> + 'a> {
+        self.0.raw_element_iter()
     }
 }
 
@@ -43,13 +55,13 @@ impl<T: ParseFromJSON> ParseFromMultipartField for JsonField<T> {
             None => Value::Null,
         };
         Ok(Self(
-            T::parse_from_json(value).map_err(ParseError::propagate)?,
+            T::parse_from_json(Some(value)).map_err(ParseError::propagate)?,
         ))
     }
 }
 
 impl<T: ToJSON> ToJSON for JsonField<T> {
-    fn to_json(&self) -> Value {
+    fn to_json(&self) -> Option<Value> {
         self.0.to_json()
     }
 }

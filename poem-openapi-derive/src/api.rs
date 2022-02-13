@@ -1,23 +1,20 @@
-use std::convert::TryFrom;
-
 use darling::{util::SpannedValue, FromMeta};
-use http::header::HeaderName;
 use indexmap::IndexMap;
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use syn::{
-    AttributeArgs, Error, FnArg, ImplItem, ImplItemMethod, ItemImpl, Lit, Meta, NestedMeta, Path,
-    ReturnType,
+    ext::IdentExt, visit_mut::VisitMut, AttributeArgs, Error, FnArg, ImplItem, ImplItemMethod,
+    ItemImpl, Pat, Path, ReturnType,
 };
 
 use crate::{
-    common_args::{APIMethod, DefaultValue, MaximumValidator, MinimumValidator, ParamIn},
+    common_args::{APIMethod, DefaultValue, ExternalDocument},
     error::GeneratorResult,
     utils::{
-        convert_oai_path, get_crate_name, get_summary_and_description, optional_literal,
-        parse_oai_attrs, remove_oai_attrs,
+        convert_oai_path, get_crate_name, get_description, get_summary_and_description,
+        optional_literal, parse_oai_attrs, remove_description, remove_oai_attrs, RemoveLifetime,
     },
-    validators::HasValidators,
+    validators::Validators,
 };
 
 #[derive(FromMeta)]
@@ -33,121 +30,56 @@ struct APIArgs {
 #[derive(FromMeta)]
 struct APIOperation {
     path: SpannedValue<String>,
-    method: APIMethod,
+    method: SpannedValue<APIMethod>,
     #[darling(default)]
     deprecated: bool,
     #[darling(default, multiple, rename = "tag")]
     tags: Vec<Path>,
     #[darling(default)]
     transform: Option<Ident>,
-}
-
-#[derive(Default)]
-struct Auth {
-    scopes: Vec<Path>,
-}
-
-impl FromMeta for Auth {
-    fn from_meta(item: &Meta) -> darling::Result<Self> {
-        match item {
-            Meta::Path(_) => Ok(Default::default()),
-            Meta::List(ls) => {
-                let mut scopes = Vec::new();
-                for item in &ls.nested {
-                    if let NestedMeta::Lit(Lit::Str(s)) = item {
-                        let path = syn::parse_str::<Path>(&s.value())?;
-                        scopes.push(path);
-                    } else {
-                        return Err(
-                            darling::Error::custom("Incorrect scope definitions.").with_span(item)
-                        );
-                    }
-                }
-                Ok(Self { scopes })
-            }
-            Meta::NameValue(_) => Err(darling::Error::custom(
-                "Incorrect scope definitions. #[oai(auth(\"read\", \"write\"))]",
-            )
-            .with_span(item)),
-        }
-    }
+    #[darling(default)]
+    operation_id: Option<String>,
+    #[darling(default)]
+    external_docs: Option<ExternalDocument>,
 }
 
 #[derive(FromMeta, Default)]
 struct APIOperationParam {
+    // for parameter
     #[darling(default)]
     name: Option<String>,
-    #[darling(default, rename = "in")]
-    param_in: Option<ParamIn>,
-    #[darling(default)]
-    private: bool,
-    #[darling(default)]
-    signed: bool,
-    #[darling(default)]
-    extract: bool,
-    #[darling(default)]
-    auth: Option<Auth>,
-    #[darling(default)]
-    desc: Option<String>,
     #[darling(default)]
     deprecated: bool,
     #[darling(default)]
     default: Option<DefaultValue>,
+    #[darling(default)]
+    validator: Option<Validators>,
 
-    #[darling(default)]
-    multiple_of: Option<SpannedValue<f64>>,
-    #[darling(default)]
-    maximum: Option<SpannedValue<MaximumValidator>>,
-    #[darling(default)]
-    minimum: Option<SpannedValue<MinimumValidator>>,
-    #[darling(default)]
-    max_length: Option<SpannedValue<usize>>,
-    #[darling(default)]
-    min_length: Option<SpannedValue<usize>>,
-    #[darling(default)]
-    pattern: Option<SpannedValue<String>>,
-    #[darling(default)]
-    max_items: Option<SpannedValue<usize>>,
-    #[darling(default)]
-    min_items: Option<SpannedValue<usize>>,
-    #[darling(default)]
-    unique_items: bool,
+    // for oauth
+    #[darling(multiple, default, rename = "scope")]
+    scopes: Vec<Path>,
 }
 
-impl_has_validators!(APIOperationParam);
-
 struct Context {
-    add_routes: IndexMap<String, Vec<TokenStream>>,
+    add_routes: IndexMap<String, IndexMap<APIMethod, TokenStream>>,
     operations: IndexMap<String, Vec<TokenStream>>,
-    param_types: Vec<TokenStream>,
-    request_types: Vec<TokenStream>,
-    response_types: Vec<TokenStream>,
-    tags: Vec<TokenStream>,
-    security_schemes: Vec<TokenStream>,
+    register_items: Vec<TokenStream>,
 }
 
 pub(crate) fn generate(
     args: AttributeArgs,
     mut item_impl: ItemImpl,
 ) -> GeneratorResult<TokenStream> {
-    let APIArgs {
-        internal,
-        prefix_path,
-        common_tags,
-    } = match APIArgs::from_list(&args) {
+    let api_args = match APIArgs::from_list(&args) {
         Ok(args) => args,
         Err(err) => return Ok(err.write_errors()),
     };
-    let crate_name = get_crate_name(internal);
+    let crate_name = get_crate_name(api_args.internal);
     let ident = item_impl.self_ty.clone();
     let mut ctx = Context {
         add_routes: Default::default(),
         operations: Default::default(),
-        param_types: Default::default(),
-        request_types: Default::default(),
-        response_types: Default::default(),
-        tags: Default::default(),
-        security_schemes: Default::default(),
+        register_items: Default::default(),
     };
 
     for item in &mut item_impl.items {
@@ -159,14 +91,7 @@ pub(crate) fn generate(
                     );
                 }
 
-                generate_operation(
-                    &mut ctx,
-                    &crate_name,
-                    &prefix_path,
-                    &common_tags,
-                    operation_args,
-                    method,
-                )?;
+                generate_operation(&mut ctx, &crate_name, &api_args, operation_args, method)?;
                 remove_oai_attrs(&mut method.attrs);
             }
         }
@@ -175,11 +100,7 @@ pub(crate) fn generate(
     let Context {
         add_routes,
         operations,
-        param_types,
-        request_types,
-        response_types,
-        tags,
-        security_schemes,
+        register_items,
     } = ctx;
 
     let paths = {
@@ -200,34 +121,13 @@ pub(crate) fn generate(
         let mut routes = Vec::new();
 
         for (path, add_route) in add_routes {
+            let add_route = add_route.values();
             routes.push(quote! {
-                at(#path, #crate_name::poem::RouteMethod::new()#(.#add_route)*)
+                at(#path, #crate_name::__private::poem::RouteMethod::new()#(.#add_route)*)
             });
         }
 
         routes
-    };
-
-    let register_items = {
-        let mut register_items = Vec::new();
-
-        for ty in param_types {
-            register_items.push(quote!(<#ty as #crate_name::types::Type>::register(registry);));
-        }
-        for ty in request_types {
-            register_items.push(quote!(<#ty as #crate_name::ApiRequest>::register(registry);));
-        }
-        for ty in response_types {
-            register_items.push(quote!(<#ty as #crate_name::ApiResponse>::register(registry);));
-        }
-        for tag in tags {
-            register_items.push(quote!(#crate_name::Tags::register(&#tag, registry);));
-        }
-        for ty in security_schemes {
-            register_items.push(quote!(<#ty as #crate_name::SecurityScheme>::register(registry);));
-        }
-
-        register_items
     };
 
     let expanded = quote! {
@@ -244,9 +144,9 @@ pub(crate) fn generate(
                 #(#register_items)*
             }
 
-            fn add_routes(self, route: #crate_name::poem::Route) -> #crate_name::poem::Route {
+            fn add_routes(self, route: #crate_name::__private::poem::Route) -> #crate_name::__private::poem::Route {
                 let api_obj = ::std::sync::Arc::new(self);
-                route#(.#routes)*
+                route #(.#routes)*
             }
         }
     };
@@ -257,8 +157,7 @@ pub(crate) fn generate(
 fn generate_operation(
     ctx: &mut Context,
     crate_name: &TokenStream,
-    prefix_path: &Option<SpannedValue<String>>,
-    common_tags: &[Path],
+    api_args: &APIArgs,
     args: APIOperation,
     item_method: &mut ImplItemMethod,
 ) -> GeneratorResult<()> {
@@ -268,19 +167,21 @@ fn generate_operation(
         deprecated,
         tags,
         transform,
+        operation_id,
+        external_docs,
     } = args;
     let http_method = method.to_http_method();
     let fn_ident = &item_method.sig.ident;
     let (summary, description) = get_summary_and_description(&item_method.attrs)?;
     let summary = optional_literal(&summary);
     let description = optional_literal(&description);
-    let tags = common_tags.iter().chain(&tags);
+    let tags = api_args.common_tags.iter().chain(&tags);
 
-    let (oai_path, new_path, path_vars) = convert_oai_path(&path, prefix_path)?;
+    let (oai_path, new_path) = convert_oai_path(&path, &api_args.prefix_path)?;
 
     if item_method.sig.inputs.is_empty() {
         return Err(Error::new_spanned(
-            &item_method.sig.inputs,
+            &item_method.sig.ident,
             "At least one `&self` receiver is required.",
         )
         .into());
@@ -302,252 +203,152 @@ fn generate_operation(
         .into());
     }
 
-    let res_ty = match &item_method.sig.output {
+    let mut res_ty = match &item_method.sig.output {
         ReturnType::Default => Box::new(syn::parse2(quote!(())).unwrap()),
         ReturnType::Type(_, ty) => ty.clone(),
     };
+    RemoveLifetime.visit_type_mut(&mut *res_ty);
 
     let mut parse_args = Vec::new();
     let mut use_args = Vec::new();
-    let mut has_request_payload = false;
-    let mut request_meta = quote!(::std::option::Option::None);
+    let mut request_meta = Vec::new();
     let mut params_meta = Vec::new();
-    let mut security_requirement = quote!(::std::option::Option::None);
+    let mut security = Vec::new();
 
     for i in 1..item_method.sig.inputs.len() {
         let arg = &mut item_method.sig.inputs[i];
-        let pat = match arg {
-            FnArg::Typed(pat) => pat,
+        let (arg_ident, mut arg_ty, operation_param, param_description) = match arg {
+            FnArg::Typed(pat) => {
+                if let Pat::Ident(ident) = &*pat.pat {
+                    let ident = ident.ident.clone();
+                    let operation_param =
+                        parse_oai_attrs::<APIOperationParam>(&pat.attrs)?.unwrap_or_default();
+                    let description = get_description(&pat.attrs)?;
+                    remove_oai_attrs(&mut pat.attrs);
+                    remove_description(&mut pat.attrs);
+                    (ident, pat.ty.clone(), operation_param, description)
+                } else {
+                    return Err(Error::new_spanned(pat, "Invalid param definition.").into());
+                }
+            }
             FnArg::Receiver(_) => {
                 return Err(Error::new_spanned(item_method, "Invalid method definition.").into());
             }
         };
+
+        RemoveLifetime.visit_type_mut(&mut *arg_ty);
+
         let pname = format_ident!("p{}", i);
-        let arg_ty = &pat.ty;
+        let param_name = operation_param
+            .name
+            .clone()
+            .unwrap_or_else(|| arg_ident.unraw().to_string());
+        use_args.push(pname.clone());
 
-        let operation_param = parse_oai_attrs::<APIOperationParam>(&pat.attrs)?;
-        remove_oai_attrs(&mut pat.attrs);
+        // register
+        ctx.register_items.push(quote! {
+            <#arg_ty as #crate_name::ApiExtractor>::register(registry);
+        });
 
-        match operation_param {
-            // is poem extractor
-            Some(operation_param) if operation_param.extract => {
-                parse_args.push(quote! {
-                    let #pname = match <#arg_ty as #crate_name::poem::FromRequest>::from_request(&request, &mut body).await.map_err(|err| #crate_name::ParseRequestError::Extractor(::std::string::ToString::to_string(&err))) {
-                        ::std::result::Result::Ok(value) => value,
-                        ::std::result::Result::Err(err) if <#res_ty as #crate_name::ApiResponse>::BAD_REQUEST_HANDLER => {
-                                return ::std::result::Result::Ok(<#res_ty as #crate_name::ApiResponse>::from_parse_request_error(err));
-                            },
-                        ::std::result::Result::Err(err) => return ::std::result::Result::Err(::std::convert::Into::into(err)),
-                    };
-                });
-                use_args.push(pname);
+        // default value for parameter
+        let default_value = match &operation_param.default {
+            Some(DefaultValue::Default) => {
+                quote!(::std::option::Option::Some(<#arg_ty as ::std::default::Default>::default))
             }
-
-            // is authorization extractor
-            Some(operation_param) if operation_param.auth.is_some() => {
-                let auth = operation_param.auth.as_ref().unwrap();
-                parse_args.push(quote! {
-                    let #pname = match <#arg_ty as #crate_name::SecurityScheme>::from_request(&request, &query.0) {
-                        ::std::result::Result::Ok(value) => value,
-                        ::std::result::Result::Err(err) if <#res_ty as #crate_name::ApiResponse>::BAD_REQUEST_HANDLER => {
-                                return ::std::result::Result::Ok(<#res_ty as #crate_name::ApiResponse>::from_parse_request_error(err));
-                            },
-                        ::std::result::Result::Err(err) => return ::std::result::Result::Err(::std::convert::Into::into(err)),
-                    };
-                });
-                use_args.push(pname);
-
-                let scopes = &auth.scopes;
-                security_requirement = quote!(::std::option::Option::Some((<#arg_ty as #crate_name::SecurityScheme>::NAME, ::std::vec![#(#crate_name::OAuthScopes::name(&#scopes)),*])));
-                ctx.security_schemes.push(quote!(#arg_ty));
+            Some(DefaultValue::Function(func_name)) => {
+                quote!(::std::option::Option::Some(#func_name))
             }
+            None => quote!(::std::option::Option::None),
+        };
+        let has_default = operation_param.default.is_some();
+        let param_meta_default = match &operation_param.default {
+            Some(DefaultValue::Default) => {
+                quote!(#crate_name::types::ToJSON::to_json(&<#arg_ty as ::std::default::Default>::default()))
+            }
+            Some(DefaultValue::Function(func_name)) => {
+                quote!(#crate_name::types::ToJSON::to_json(&#func_name()))
+            }
+            None => quote!(::std::option::Option::None),
+        };
 
-            // is parameter
-            Some(operation_param) => {
-                let param_oai_typename = match &operation_param.name {
-                    Some(name) => name.clone(),
-                    None => {
-                        return Err(Error::new_spanned(
-                            arg,
-                            r#"Missing a name. #[oai(name = "...")]"#,
-                        )
-                        .into());
-                    }
-                };
-
-                let param_in = match operation_param.param_in {
-                    Some(param_in) => param_in,
-                    None => {
-                        return Err(Error::new_spanned(
-                            arg,
-                            r#"Missing a input type. #[oai(in = "...")]"#,
-                        )
-                        .into());
-                    }
-                };
-
-                if param_in == ParamIn::Path && !path_vars.contains(&*param_oai_typename) {
-                    return Err(Error::new_spanned(
-                        arg,
-                        format!(
-                            "The parameter `{}` is not defined in the path.",
-                            param_oai_typename
-                        ),
-                    )
-                    .into());
-                } else if param_in == ParamIn::Header
-                    && HeaderName::try_from(&param_oai_typename).is_err()
-                {
-                    return Err(Error::new_spanned(
-                        arg,
-                        format!(
-                            "The parameter name `{}` is not a valid header name.",
-                            param_oai_typename
-                        ),
-                    )
-                    .into());
-                }
-
-                let meta_in = {
-                    let meta_ty = match param_in {
-                        ParamIn::Path => quote!(Path),
-                        ParamIn::Query => quote!(Query),
-                        ParamIn::Header => quote!(Header),
-                        ParamIn::Cookie if operation_param.private => quote!(CookiePrivate),
-                        ParamIn::Cookie if operation_param.signed => quote!(CookieSigned),
-                        ParamIn::Cookie => quote!(Cookie),
-                    };
-                    quote!(#crate_name::registry::MetaParamIn::#meta_ty)
-                };
-                let validators_checker = operation_param
-                    .validators()
-                    .create_param_checker(crate_name, &param_oai_typename)?;
-                let validators_update_meta = operation_param
-                    .validators()
-                    .create_update_meta(crate_name)?;
-
-                match &operation_param.default {
-                    Some(default_value) => {
-                        let default_value = match default_value {
-                            DefaultValue::Default => {
-                                quote!(<#arg_ty as ::std::default::Default>::default())
-                            }
-                            DefaultValue::Function(func_name) => quote!(#func_name()),
-                        };
-
-                        parse_args.push(quote! {
-                            let #pname = {
-                                let value = #crate_name::param::get(#param_oai_typename, #meta_in, &request, &query.0);
-                                let value = value.as_deref();
-                                match value {
-                                    Some(value) => {
-                                        match #crate_name::types::ParseFromParameter::parse_from_parameter(Some(value))
-                                                .map_err(|err| #crate_name::ParseRequestError::ParseParam {
-                                                    name: #param_oai_typename,
-                                                    reason: err.into_message(),
-                                                })
-                                        {
-                                            ::std::result::Result::Ok(value) => {
-                                                #validators_checker
-                                                value
-                                            },
-                                            ::std::result::Result::Err(err) if <#res_ty as #crate_name::ApiResponse>::BAD_REQUEST_HANDLER => {
-                                                return ::std::result::Result::Ok(<#res_ty as #crate_name::ApiResponse>::from_parse_request_error(err));
-                                            },
-                                            ::std::result::Result::Err(err) => return ::std::result::Result::Err(#crate_name::poem::Error::from(err)),
-                                        }
-                                    }
-                                    None => #default_value,
-                                }
-                            };
-                        });
-                    }
-                    None => {
-                        parse_args.push(quote! {
-                            let #pname = {
-                                let value = #crate_name::param::get(#param_oai_typename, #meta_in, &request, &query.0);
-                                match #crate_name::types::ParseFromParameter::parse_from_parameter(value.as_deref())
-                                        .map_err(|err| #crate_name::ParseRequestError::ParseParam {
-                                            name: #param_oai_typename,
-                                            reason: err.into_message(),
-                                        })
-                                {
-                                    ::std::result::Result::Ok(value) => {
-                                        #validators_checker
-                                        value
-                                    },
-                                    ::std::result::Result::Err(err) if <#res_ty as #crate_name::ApiResponse>::BAD_REQUEST_HANDLER => {
-                                        return ::std::result::Result::Ok(<#res_ty as #crate_name::ApiResponse>::from_parse_request_error(err));
-                                    },
-                                    ::std::result::Result::Err(err) => return ::std::result::Result::Err(::std::convert::Into::into(err)),
-                                }
-                            };
-                        });
+        // validator
+        let validator = operation_param.validator.clone().unwrap_or_default();
+        let param_checker = validator.create_param_checker(crate_name, &res_ty, &param_name)?.map(|stream| {
+            quote! {
+                if <#arg_ty as #crate_name::ApiExtractor>::TYPE == #crate_name::ApiExtractorType::Parameter {
+                    if let ::std::option::Option::Some(value) = #crate_name::ApiExtractor::param_raw_type(&#pname) {
+                        #stream
                     }
                 }
+            }
+        }).unwrap_or_default();
+        let validators_update_meta = validator.create_update_meta(crate_name)?;
 
-                let meta_arg_default = match &operation_param.default {
-                    Some(DefaultValue::Default) => quote! {
-                        ::std::option::Option::Some(#crate_name::types::ToJSON::to_json(&<#arg_ty as ::std::default::Default>::default()))
-                    },
-                    Some(DefaultValue::Function(func_name)) => quote! {
-                        ::std::option::Option::Some(#crate_name::types::ToJSON::to_json(&#func_name()))
-                    },
-                    None => quote!(::std::option::Option::None),
+        // do extract
+        parse_args.push(quote! {
+            let mut param_opts = #crate_name::ExtractParamOptions {
+                name: #param_name,
+                default_value: #default_value,
+            };
+
+            let #pname = match <#arg_ty as #crate_name::ApiExtractor>::from_request(&request, &mut body, param_opts).await {
+                ::std::result::Result::Ok(value) => value,
+                ::std::result::Result::Err(err) if <#res_ty as #crate_name::ApiResponse>::BAD_REQUEST_HANDLER => {
+                    let res = <#res_ty as #crate_name::ApiResponse>::from_parse_request_error(err);
+                    let res = #crate_name::__private::poem::error::IntoResult::into_result(res);
+                    return ::std::result::Result::map(res, #crate_name::__private::poem::IntoResponse::into_response);
+                }
+                ::std::result::Result::Err(err) => return ::std::result::Result::Err(::std::convert::Into::into(err)),
+            };
+            #param_checker
+        });
+
+        // param meta
+        let param_desc = optional_literal(&param_description);
+        let deprecated = operation_param.deprecated;
+        params_meta.push(quote! {
+            if <#arg_ty as #crate_name::ApiExtractor>::TYPE == #crate_name::ApiExtractorType::Parameter {
+                let mut original_schema = <#arg_ty as #crate_name::ApiExtractor>::param_schema_ref().unwrap();
+
+                let mut patch_schema = {
+                    let mut schema = #crate_name::registry::MetaSchema::ANY;
+                    schema.default = #param_meta_default;
+                    #validators_update_meta
+                    schema
                 };
 
-                use_args.push(pname);
-
-                let desc = optional_literal(&operation_param.desc);
-                let deprecated = operation_param.deprecated;
-                params_meta.push(quote! {
-                    #[allow(unused_mut)]
-                    #crate_name::registry::MetaOperationParam {
-                        name: #param_oai_typename,
-                        schema: {
-                            <#arg_ty as #crate_name::types::Type>::schema_ref().merge({
-                                let mut schema = #crate_name::registry::MetaSchema::ANY;
-                                schema.default = #meta_arg_default;
-                                #validators_update_meta
-                                schema
-                            })
-                        },
-                        in_type: #meta_in,
-                        description: #desc,
-                        required: <#arg_ty as #crate_name::types::Type>::IS_REQUIRED,
-                        deprecated: #deprecated,
-                    }
-                });
-                ctx.param_types.push(quote!(#arg_ty));
+                let meta_param = #crate_name::registry::MetaOperationParam {
+                    name: #param_name,
+                    schema: original_schema.merge(patch_schema),
+                    in_type: <#arg_ty as #crate_name::ApiExtractor>::param_in().unwrap(),
+                    description: #param_desc,
+                    required: <#arg_ty as #crate_name::ApiExtractor>::PARAM_IS_REQUIRED && !#has_default,
+                    deprecated: #deprecated,
+                };
+                params.push(meta_param);
             }
+        });
 
-            // is request body
-            None => {
-                if has_request_payload {
-                    return Err(
-                        Error::new_spanned(arg, "Only one request payload is allowed.").into(),
-                    );
-                }
-
-                parse_args.push(quote! {
-                    let #pname = match <#arg_ty as #crate_name::ApiRequest>::from_request(&request, &mut body).await {
-                        ::std::result::Result::Ok(value) => value,
-                        ::std::result::Result::Err(err) if <#res_ty as #crate_name::ApiResponse>::BAD_REQUEST_HANDLER => {
-                                return ::std::result::Result::Ok(<#res_ty as #crate_name::ApiResponse>::from_parse_request_error(err));
-                            },
-                        ::std::result::Result::Err(err) => return ::std::result::Result::Err(::std::convert::Into::into(err)),
-                    };
-                });
-                use_args.push(pname);
-
-                has_request_payload = true;
-                request_meta = quote!(::std::option::Option::Some(<#arg_ty as #crate_name::ApiRequest>::meta()));
-                ctx.request_types.push(quote!(#arg_ty));
+        // request object meta
+        request_meta.push(quote! {
+            if <#arg_ty as #crate_name::ApiExtractor>::TYPE == #crate_name::ApiExtractorType::RequestObject {
+                request = <#arg_ty as #crate_name::ApiExtractor>::request_meta();
             }
-        }
+        });
+
+        // security meta
+        let scopes = &operation_param.scopes;
+        security.push(quote! {
+            if <#arg_ty as #crate_name::ApiExtractor>::TYPE == #crate_name::ApiExtractorType::SecurityScheme {
+                security = ::std::vec![<::std::collections::HashMap<&'static str, ::std::vec::Vec<&'static str>> as ::std::convert::From<_>>::from([
+                    (<#arg_ty as #crate_name::ApiExtractor>::security_scheme().unwrap(), ::std::vec![#(#crate_name::OAuthScopes::name(&#scopes)),*])
+                ])];
+            }
+        });
     }
 
-    ctx.response_types.push(quote!(#res_ty));
+    ctx.register_items
+        .push(quote!(<#res_ty as #crate_name::ApiResponse>::register(registry);));
 
     let transform = transform.map(|transform| {
         quote! {
@@ -555,40 +356,66 @@ fn generate_operation(
         }
     });
 
-    ctx.add_routes.entry(new_path).or_default().push(quote! {
-        method(#crate_name::poem::http::Method::#http_method, {
+    if ctx.add_routes.entry(new_path).or_default().insert(*method, quote! {
+        method(#crate_name::__private::poem::http::Method::#http_method, {
             let api_obj = ::std::clone::Clone::clone(&api_obj);
-            let ep = #crate_name::poem::endpoint::make(move |request| {
+            let ep = #crate_name::__private::poem::endpoint::make(move |request| {
                 let api_obj = ::std::clone::Clone::clone(&api_obj);
                 async move {
                     let (request, mut body) = request.split();
-                    let query = <#crate_name::poem::web::Query::<::std::collections::HashMap<::std::string::String, ::std::string::String>> as #crate_name::poem::FromRequest>::from_request(&request, &mut body).await.unwrap_or_default();
                     #(#parse_args)*
-                    ::std::result::Result::Ok::<_, #crate_name::poem::Error>(api_obj.#fn_ident(#(#use_args),*).await)
+                    let res = api_obj.#fn_ident(#(#use_args),*).await;
+                    let res = #crate_name::__private::poem::error::IntoResult::into_result(res);
+                    ::std::result::Result::map(res, #crate_name::__private::poem::IntoResponse::into_response)
                 }
             });
             #transform
             ep
         })
-    });
+    }).is_some() {
+        return Err(Error::new(method.span(), "duplicate method").into());
+    }
 
     let mut tag_names = Vec::new();
     for tag in tags {
-        ctx.tags.push(quote!(#tag));
+        ctx.register_items
+            .push(quote!(#crate_name::Tags::register(&#tag, registry);));
         tag_names.push(quote!(#crate_name::Tags::name(&#tag)));
     }
+    let operation_id = optional_literal(&operation_id);
+    let external_docs = match external_docs {
+        Some(external_docs) => {
+            let s = external_docs.to_token_stream(crate_name);
+            quote!(::std::option::Option::Some(#s))
+        }
+        None => quote!(::std::option::Option::None),
+    };
 
     ctx.operations.entry(oai_path).or_default().push(quote! {
         #crate_name::registry::MetaOperation {
             tags: ::std::vec![#(#tag_names),*],
-            method: #crate_name::poem::http::Method::#http_method,
+            method: #crate_name::__private::poem::http::Method::#http_method,
             summary: #summary,
             description: #description,
-            params: ::std::vec![#(#params_meta),*],
-            request: #request_meta,
+            external_docs: #external_docs,
+            params: {
+                let mut params = ::std::vec::Vec::new();
+                #(#params_meta)*
+                params
+            },
+            request: {
+                let mut request = ::std::option::Option::None;
+                #(#request_meta)*
+                request
+            },
             responses: <#res_ty as #crate_name::ApiResponse>::meta(),
             deprecated: #deprecated,
-            security: ::std::vec![::std::iter::FromIterator::from_iter(::std::iter::IntoIterator::into_iter(#security_requirement))],
+            security: {
+                let mut security = ::std::vec![];
+                #(#security)*
+                security
+            },
+            operation_id: #operation_id,
         }
     });
 
